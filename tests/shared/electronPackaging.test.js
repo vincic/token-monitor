@@ -10,6 +10,7 @@ test('Electron package excludes Python bytecode from integrations', () => {
   assert.ok(pkg.build.files.includes('integrations/**/*'));
   assert.ok(pkg.build.files.includes('!integrations/**/__pycache__/**'));
   assert.ok(pkg.build.files.includes('!integrations/**/*.pyc'));
+  assert.equal(fs.existsSync(path.join(process.cwd(), 'integrations', 'agent-lifecycle', 'codex-hook-trust.js')), true);
   const hermesSettings = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'integrations', 'hermes', 'token-monitor-agent-state', 'settings.json'), 'utf8'));
   assert.equal(hermesSettings.tokenMonitorManaged, 'token-monitor-agent-lifecycle:v1');
   assert.equal(hermesSettings.stateRoot, '');

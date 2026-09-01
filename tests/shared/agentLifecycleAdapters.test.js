@@ -105,6 +105,10 @@ function codexEscapedAppServerKey(hook) {
   return `C:\\Users\\me\\.codex\\config.toml:${event}:1:${hook.hookIndex}`;
 }
 
+function codexTrustHelperStdout(result) {
+  return `${JSON.stringify({ ok: true, result })}\n`;
+}
+
 function runInstalledHermesDiagnostic(t, options = {}) {
   const homeDir = tempRoot();
   const hermesHome = path.join(homeDir, '.hermes');
@@ -450,40 +454,23 @@ test('Codex install writes native nested hooks, preserves unrelated state, and t
   ].join('\n'));
 
   const commandRunner = (command, args, runOptions) => {
-    assert.equal(command, 'codex');
-    assert.deepEqual(args, ['app-server', '--stdio']);
-    assert.doesNotMatch(runOptions.input, /dangerously-bypass-hook-trust/);
-    const requests = runOptions.input.trim().split(/\n/).map((line) => JSON.parse(line));
-    assert.deepEqual(requests.map((request) => ({ id: request.id, method: request.method })), [
-      { id: 1, method: 'initialize' },
-      { id: undefined, method: 'initialized' },
-      { id: 2, method: 'hooks/list' }
-    ]);
-    assert.equal(requests[0].params.clientInfo.name, 'SidePulse Token Monitor');
-    assert.equal(requests[0].params.clientInfo.version, '2.0.0');
-    assert.equal(requests[0].params.capabilities, null);
-    assert.deepEqual(requests[1].params, {});
-    assert.ok(requests[2].params.cwds.includes(process.cwd()));
-    assert.ok(requests[2].params.cwds.includes(path.dirname(configPath)));
+    assert.equal(command, process.execPath);
+    assert.equal(path.basename(args[0]), 'codex-hook-trust.js');
+    assert.deepEqual(args.slice(1, 5), ['--codex-command', 'codex', '--timeout-ms', '5000']);
+    assert.equal(Object.hasOwn(runOptions, 'input'), false);
+    const cwds = args.reduce((values, arg, index) => arg === '--cwd' ? [...values, args[index + 1]] : values, []);
+    assert.ok(cwds.includes(process.cwd()));
+    assert.ok(cwds.includes(path.dirname(configPath)));
     const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
     return {
       status: 0,
-      stdout: [
-        'stderr-like non-json line',
-        JSON.stringify({ jsonrpc: '2.0', method: 'window/logMessage', params: { message: 'ignored notification' } }),
-        JSON.stringify({ jsonrpc: '2.0', id: 1, result: { capabilities: { ignored: true } } }),
-        JSON.stringify({
-        jsonrpc: '2.0',
-        id: 2,
-        result: {
+      stdout: codexTrustHelperStdout({
           data: [
             { cwd: homeDir, hooks: [{ key: 'sidepulse.SessionStart.0.0', command: 'sidepulse', currentHash: 'new-sidepulse-hash' }] },
             { cwd: process.cwd(), hooks: managed.map((hook) => ({ key: codexAppServerKey(configPath, hook), command: hook.command, current_hash: `hash-${hook.event}` })) },
             { cwd: '/tmp/other', hooks: [{ key: 'other.PostToolUse.2.0', command: 'other-command', currentHash: 'other-hash' }] }
           ]
-        }
       })
-      ].join('\n') + '\n'
     };
   };
 
@@ -544,7 +531,7 @@ test('Codex trust discovery accepts duplicate identical app-server hook entries 
     const hooks = managed.map((hook) => ({ key: codexAppServerKey(configPath, hook), command: hook.command, currentHash: `hash-${hook.event}` }));
     return {
       status: 0,
-      stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { data: [{ cwd: homeDir, hooks }, { cwd: process.cwd(), hooks }] } })}\n`
+      stdout: codexTrustHelperStdout({ data: [{ cwd: homeDir, hooks }, { cwd: process.cwd(), hooks }] })
     };
   };
 
@@ -557,6 +544,77 @@ test('Codex trust discovery accepts duplicate identical app-server hook entries 
   assert.equal(trust.size, CODEX_HOOK_EVENTS.length);
 });
 
+test('Codex trust discovery uses interactive app-server sequencing through helper', (t) => {
+  const homeDir = tempRoot();
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+  const writerPath = path.join(homeDir, 'agent-event.js');
+  const stateRoot = path.join(homeDir, 'state');
+  const eventsPath = path.join(homeDir, 'rpc-events.json');
+  const fakeScriptPath = path.join(homeDir, process.platform === 'win32' ? 'fake-codex.js' : 'fake-codex');
+  const fakeCommandPath = process.platform === 'win32' ? path.join(homeDir, 'fake-codex.cmd') : fakeScriptPath;
+  fs.writeFileSync(fakeScriptPath, `#!/usr/bin/env node
+'use strict';
+const fs = require('node:fs');
+const readline = require('node:readline');
+const { parseCodexManagedHooks } = require(${JSON.stringify(path.join(process.cwd(), 'src', 'shared', 'agentLifecycleAdapters.js'))});
+if (process.argv[2] !== 'app-server' || process.argv[3] !== '--stdio') process.exit(64);
+const events = [];
+let initialized = false;
+let listed = false;
+function persist() { fs.writeFileSync(${JSON.stringify(eventsPath)}, JSON.stringify(events)); }
+function send(message) { process.stdout.write(JSON.stringify(message) + '\\n'); }
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on('line', (line) => {
+  let message;
+  try { message = JSON.parse(line); } catch (_) { return; }
+  events.push(message.method || ('id:' + message.id));
+  persist();
+  if (message.method === 'initialize' && message.id === 1) {
+    send({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2026-09-01' } });
+    return;
+  }
+  if (message.method === 'initialized') {
+    initialized = true;
+    return;
+  }
+  if (message.method === 'hooks/list' && message.id === 2 && initialized) {
+    listed = true;
+    const hooks = parseCodexManagedHooks(fs.readFileSync(${JSON.stringify(configPath)}, 'utf8'))
+      .map((hook) => ({ key: ${JSON.stringify(configPath)} + ':hooks.' + hook.event + '[' + hook.outerIndex + '].hooks[' + hook.hookIndex + ']', command: hook.command, currentHash: 'interactive-hash-' + hook.event }));
+    send({ jsonrpc: '2.0', id: 2, result: { data: [{ cwd: process.cwd(), hooks }] } });
+  }
+});
+process.stdin.on('end', () => {
+  if (!listed) persist();
+});
+`);
+  if (process.platform === 'win32') {
+    fs.writeFileSync(fakeCommandPath, `@"${process.execPath}" "${fakeScriptPath}" %*\r\n`);
+  } else {
+    fs.chmodSync(fakeScriptPath, 0o700);
+  }
+
+  const result = installCodexLifecycle({
+    homeDir,
+    codexConfigPath: configPath,
+    codexVersion: '0.150.1',
+    stateRoot,
+    writerPath,
+    codexCommand: fakeCommandPath
+  });
+  if (result.trustCode === 'codex_app_server_unavailable' && /EPERM/.test(result.trustReason || '')) {
+    t.skip('sandbox suppressed nested helper child process');
+    return;
+  }
+
+  assert.equal(result.ok, true);
+  assert.equal(result.trustConfigured, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(eventsPath, 'utf8')), ['initialize', 'initialized', 'hooks/list']);
+  const trust = parseCodexTrustedHookState(fs.readFileSync(configPath, 'utf8'));
+  assert.equal(trust.size, CODEX_HOOK_EVENTS.length);
+  assert.equal([...trust.values()].every((hash) => hash.startsWith('interactive-hash-')), true);
+});
+
 test('Codex trust discovery accepts complete hooks/list stdout before app-server timeout', () => {
   const homeDir = tempRoot();
   const configPath = path.join(homeDir, '.codex', 'config.toml');
@@ -564,30 +622,22 @@ test('Codex trust discovery accepts complete hooks/list stdout before app-server
   const stateRoot = path.join(homeDir, 'state');
   const timeout = Object.assign(new Error('spawnSync codex ETIMEDOUT'), { code: 'ETIMEDOUT' });
   const commandRunner = (command, args, runOptions) => {
-    assert.equal(command, 'codex');
-    assert.deepEqual(args, ['app-server', '--stdio']);
-    assert.equal(runOptions.timeout, 5000);
+    assert.equal(command, process.execPath);
+    assert.equal(path.basename(args[0]), 'codex-hook-trust.js');
+    assert.equal(runOptions.timeout, 6000);
     const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
     return {
       error: timeout,
       status: null,
-      stdout: [
-        JSON.stringify({ jsonrpc: '2.0', method: 'window/logMessage', params: { message: 'still alive' } }),
-        JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2024-11-05' } }),
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: 2,
-          result: {
-            data: [{
-              hooks: managed.map((hook) => ({
-                key: codexAppServerKey(configPath, hook),
-                command: hook.command,
-                currentHash: `timeout-hash-${hook.event}`
-              }))
-            }]
-          }
-        })
-      ].join('\n') + '\n'
+      stdout: codexTrustHelperStdout({
+        data: [{
+          hooks: managed.map((hook) => ({
+            key: codexAppServerKey(configPath, hook),
+            command: hook.command,
+            currentHash: `timeout-hash-${hook.event}`
+          }))
+        }]
+      })
     };
   };
 
@@ -612,7 +662,7 @@ test('Codex trust discovery rejects app-server timeout without complete hooks/li
   const commandRunner = () => ({
     error: timeout,
     status: null,
-    stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2024-11-05' } })}\n`
+    stdout: ''
   });
 
   const result = installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
@@ -623,6 +673,31 @@ test('Codex trust discovery rejects app-server timeout without complete hooks/li
   assert.equal(result.trustCode, 'codex_app_server_unavailable');
   assert.deepEqual(parseCodexManagedTrustEntries(installed), []);
   assert.deepEqual([...parseCodexTrustedHookState(installed).keys()], []);
+});
+
+test('Codex trust discovery fails honestly on malformed or failed helper output', () => {
+  for (const [stdout, expectedCode] of [
+    ['not json\n', 'trust_discovery_parse_failed'],
+    [`${JSON.stringify({ ok: false, code: 'codex_app_server_timeout', reason: 'timed out' })}\n`, 'codex_app_server_timeout']
+  ]) {
+    const homeDir = tempRoot();
+    const configPath = path.join(homeDir, '.codex', 'config.toml');
+    const result = installCodexLifecycle({
+      homeDir,
+      codexConfigPath: configPath,
+      codexVersion: '0.150.1',
+      stateRoot: path.join(homeDir, 'state'),
+      writerPath: path.join(homeDir, 'agent-event.js'),
+      commandRunner: () => ({ status: expectedCode === 'codex_app_server_timeout' ? 1 : 0, stdout, stderr: '' })
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.trustConfigured, false);
+    assert.equal(result.trustCode, expectedCode);
+    const installed = fs.readFileSync(configPath, 'utf8');
+    assert.deepEqual(parseCodexManagedTrustEntries(installed), []);
+    assert.deepEqual([...parseCodexTrustedHookState(installed).keys()], []);
+  }
 });
 
 test('Codex reinstall fallback removes prior managed exact trust and leaves no orphan for uninstall', () => {
@@ -651,23 +726,19 @@ test('Codex reinstall fallback removes prior managed exact trust and leaves no o
       return {
         error: timeout,
         status: null,
-        stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2024-11-05' } })}\n`
+        stdout: ''
       };
     }
     const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
     return {
       status: 0,
-      stdout: `${JSON.stringify({
-        jsonrpc: '2.0',
-        id: 2,
-        result: {
-          hooks: managed.map((hook) => ({
-            key: `${configPath}:managed:${hook.event}:${hook.outerIndex}:${hook.hookIndex}`,
-            command: hook.command,
-            currentHash: `hash-${hook.event}`
-          }))
-        }
-      })}\n`
+      stdout: codexTrustHelperStdout({
+        hooks: managed.map((hook) => ({
+          key: `${configPath}:managed:${hook.event}:${hook.outerIndex}:${hook.hookIndex}`,
+          command: hook.command,
+          currentHash: `hash-${hook.event}`
+        }))
+      })
     };
   };
 
@@ -712,7 +783,7 @@ test('Codex trust discovery rejects conflicting duplicate app-server hook entrie
     const conflict = { ...hooks[0], currentHash: 'different-hash' };
     return {
       status: 0,
-      stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { data: [{ cwd: homeDir, hooks }, { cwd: process.cwd(), hooks: [conflict] }] } })}\n`
+      stdout: codexTrustHelperStdout({ data: [{ cwd: homeDir, hooks }, { cwd: process.cwd(), hooks: [conflict] }] })
     };
   };
 
@@ -736,19 +807,15 @@ test('Codex reinstall atomically refreshes exact managed trust keys', () => {
     const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
     return {
       status: 0,
-      stdout: `${JSON.stringify({
-        jsonrpc: '2.0',
-        id: 2,
-        result: {
-          data: [{
-            hooks: managed.map((hook) => ({
-              key: `${configPath}:gen-${generation}:hooks.${hook.event}[${hook.outerIndex}].hooks[${hook.hookIndex}]`,
-              command: hook.command,
-              currentHash: `hash-${generation}-${hook.event}`
-            }))
-          }]
-        }
-      })}\n`
+      stdout: codexTrustHelperStdout({
+        data: [{
+          hooks: managed.map((hook) => ({
+            key: `${configPath}:gen-${generation}:hooks.${hook.event}[${hook.outerIndex}].hooks[${hook.hookIndex}]`,
+            command: hook.command,
+            currentHash: `hash-${generation}-${hook.event}`
+          }))
+        }]
+      })
     };
   };
 
@@ -769,7 +836,7 @@ test('Codex analyzer treats missing or wrong nested hook async as partial, not e
   const homeDir = tempRoot();
   const writerPath = path.join(homeDir, 'agent-event.js');
   const stateRoot = path.join(homeDir, 'state');
-  const commandRunner = () => ({ status: 0, stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { hooks: [] } })}\n` });
+  const commandRunner = () => ({ status: 0, stdout: codexTrustHelperStdout({ hooks: [] }) });
   const configPath = path.join(homeDir, '.codex', 'config.toml');
 
   installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
@@ -807,16 +874,12 @@ test('Codex install reports unconfigured trust when app-server omits current Tok
     writerPath,
     commandRunner: () => ({
       status: 0,
-      stdout: `${JSON.stringify({
-        jsonrpc: '2.0',
-        id: 2,
-        result: {
-          providers: [
-            { name: 'sidepulse', hooks: [{ key: 'sidepulse.SessionStart.0.0', command: 'sidepulse', currentHash: 'sidepulse-hash' }] },
-            { name: 'token-monitor', hooks: [{ key: 'wrong.0.0', command: 'not-token-monitor', currentHash: 'wrong-hash' }] }
-          ]
-        }
-      })}\n`
+      stdout: codexTrustHelperStdout({
+        providers: [
+          { name: 'sidepulse', hooks: [{ key: 'sidepulse.SessionStart.0.0', command: 'sidepulse', currentHash: 'sidepulse-hash' }] },
+          { name: 'token-monitor', hooks: [{ key: 'wrong.0.0', command: 'not-token-monitor', currentHash: 'wrong-hash' }] }
+        ]
+      })
     })
   });
 
@@ -874,17 +937,13 @@ test('Codex install and doctor round-trip escaped exact app-server trust keys', 
     const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
     return {
       status: 0,
-      stdout: `${JSON.stringify({
-        jsonrpc: '2.0',
-        id: 2,
-        result: {
-          hooks: managed.map((hook) => ({
-            key: codexEscapedAppServerKey(hook),
-            command: hook.command,
-            currentHash: `hash-${hook.event}`
-          }))
-        }
-      })}\n`
+      stdout: codexTrustHelperStdout({
+        hooks: managed.map((hook) => ({
+          key: codexEscapedAppServerKey(hook),
+          command: hook.command,
+          currentHash: `hash-${hook.event}`
+        }))
+      })
     };
   };
 

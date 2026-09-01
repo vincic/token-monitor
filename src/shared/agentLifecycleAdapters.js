@@ -16,6 +16,7 @@ const MAX_NATIVE_PAYLOAD_BYTES = 1024 * 1024;
 const MAX_CONFIGURED_STATE_ROOT_CHARS = 4096;
 const CODEX_APP_SERVER_TIMEOUT_MS = 5000;
 const CODEX_MANAGED_TRUST_ENTRY_LIMIT = 64;
+const CODEX_HOOK_TRUST_HELPER = path.resolve(__dirname, '..', '..', 'integrations', 'agent-lifecycle', 'codex-hook-trust.js');
 const HERMES_HOOKS = Object.freeze([
   'on_session_start',
   'on_session_reset',
@@ -1283,6 +1284,28 @@ function parseCodexAppServerHookListResult(output, protocol = {}) {
   }
 }
 
+function parseCodexHookTrustHelperResult(output) {
+  const lines = String(output || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return { ok: false, code: 'trust_discovery_no_response' };
+  let envelope;
+  try {
+    envelope = JSON.parse(lines[0]);
+  } catch (error) {
+    return { ok: false, code: 'trust_discovery_parse_failed', reason: error.message };
+  }
+  if (!envelope || typeof envelope !== 'object') return { ok: false, code: 'trust_discovery_parse_failed', reason: 'Helper returned a non-object response.' };
+  if (envelope.ok === false) {
+    return {
+      ok: false,
+      code: compactString(envelope.code, 128) || 'trust_discovery_failed',
+      reason: compactString(envelope.reason, 512) || 'Codex hook trust helper failed.'
+    };
+  }
+  const parsed = envelope.result || envelope.data || envelope.hooks || envelope.items;
+  if (!parsed || typeof parsed !== 'object') return { ok: false, code: 'trust_discovery_no_response' };
+  return { ok: true, parsed };
+}
+
 function codexAppServerTerminationMetadata(result) {
   if (!result) return {};
   const metadata = {};
@@ -1377,16 +1400,6 @@ function selectCodexManagedTrustEntries(entries, managedHooks) {
   };
 }
 
-function codexHookTrustRequest(protocol = {}) {
-  if (typeof protocol.hookListRequest === 'function') return protocol.hookListRequest();
-  const cwds = Array.isArray(protocol.cwds) ? protocol.cwds : [];
-  return [
-    { jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'SidePulse Token Monitor', version: AGENT_LIFECYCLE_ADAPTER_VERSION }, capabilities: null } },
-    { jsonrpc: '2.0', method: 'initialized', params: {} },
-    { jsonrpc: '2.0', id: 2, method: 'hooks/list', params: { cwds } }
-  ].map((message) => JSON.stringify(message)).join('\n') + '\n';
-}
-
 function codexHookTrustCwds(options = {}) {
   const candidates = [
     options.cwd,
@@ -1420,23 +1433,31 @@ function discoverCodexHookTrust(options = {}, managedHooks = []) {
   const runner = commandRunner(options);
   const command = options.codexCommand || 'codex';
   const protocol = { cwds: codexHookTrustCwds(options), ...(options.codexAppServerProtocol || {}) };
+  const cwds = Array.isArray(protocol.cwds) ? protocol.cwds : [];
+  const helperPath = options.codexHookTrustHelperPath || CODEX_HOOK_TRUST_HELPER;
+  const helperArgs = [
+    helperPath,
+    '--codex-command',
+    command,
+    '--timeout-ms',
+    String(options.codexAppServerTimeoutMs || CODEX_APP_SERVER_TIMEOUT_MS),
+    ...cwds.flatMap((cwd) => ['--cwd', cwd])
+  ];
   let result;
   try {
-    result = runner(command, ['app-server', '--stdio'], {
-      input: codexHookTrustRequest(protocol),
+    result = runner(process.execPath, helperArgs, {
       encoding: 'utf8',
       env: options.env || process.env,
-      timeout: options.codexAppServerTimeoutMs || CODEX_APP_SERVER_TIMEOUT_MS,
+      timeout: (options.codexAppServerTimeoutMs || CODEX_APP_SERVER_TIMEOUT_MS) + 1000,
       maxBuffer: 1024 * 1024
     });
   } catch (error) {
     return { ok: false, code: 'trust_discovery_failed', trustConfigured: false, reason: error.message };
   }
   const terminated = Boolean(result && (result.error || result.status !== 0));
-  const parsed = parseCodexAppServerHookListResult(
-    result?.stdout,
-    terminated ? { ...protocol, requireHookListResponseId: true } : protocol
-  );
+  const parsed = typeof protocol.parseHookListResponse === 'function'
+    ? parseCodexAppServerHookListResult(result?.stdout, terminated ? { ...protocol, requireHookListResponseId: true } : protocol)
+    : parseCodexHookTrustHelperResult(result?.stdout);
   if (parsed.ok) {
     const entries = flattenCodexHookList(parsed.parsed);
     const selected = selectCodexManagedTrustEntries(entries.filter((entry) => commands.has(entry.command)), managedHooks);
@@ -1452,6 +1473,14 @@ function discoverCodexHookTrust(options = {}, managedHooks = []) {
       selectedCount: selected.selectedCount,
       duplicateCount: selected.duplicateCount,
       ...codexAppServerTerminationMetadata(result)
+    };
+  }
+  if (result?.stdout && parsed.code) {
+    return {
+      ok: false,
+      code: parsed.code,
+      trustConfigured: false,
+      reason: parsed.reason || 'Codex hook trust helper failed.'
     };
   }
   if (!result || result.error || result.status !== 0) {
