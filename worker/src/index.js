@@ -2,6 +2,7 @@ import { publicLimits } from './shared/limits.js';
 import subscriptionDisplay from './shared/subscriptionDisplay.js';
 import currency from './shared/currency.js';
 import { aggregateDevices, mergeDeviceRecord, aggregateHistory } from './shared/usage.js';
+import { agentStatesFutureClockError, agentStatesWireIdentityError, expireAgentStates } from './shared/agentActivity.js';
 import { DEFAULT_STALE_AFTER_MS } from './shared/syncUploadInterval.js';
 import { deviceHistoryRevision, historyPreview, historyRevision } from './shared/history.js';
 import hubBuildIdentity from './shared/hubBuildIdentity.js';
@@ -170,6 +171,7 @@ export class HubDO {
       const stats = await this.getStats();
       const { devices, limits, periods, ...rest } = stats;
       delete rest.deviceHistoryRevision;
+      delete rest.agentActivity;
       return jsonResponse(200, {
         ok: true,
         source: 'cloudflare-worker',
@@ -229,9 +231,17 @@ export class HubDO {
       try { payload = await request.json(); }
       catch (error) { return jsonResponse(400, { error: 'bad_request', message: error.message }); }
       if (!payload.deviceId && !payload.id) return jsonResponse(400, { error: 'deviceId_required' });
+      const identityError = agentStatesWireIdentityError(payload);
+      if (identityError) return jsonResponse(400, { error: 'bad_request', message: identityError });
       const deviceId = String(payload.deviceId || payload.id);
+      const receivedAt = new Date();
+      const clockError = agentStatesFutureClockError(payload, { nowMs: receivedAt.getTime() });
+      if (clockError) return jsonResponse(400, { error: 'bad_request', message: clockError });
       const existing = await this.state.storage.get(`dev:${deviceId}`);
-      const record = mergeDeviceRecord(existing, { ...payload, receivedAt: new Date().toISOString() });
+      const record = mergeDeviceRecord(existing, { ...payload, receivedAt: receivedAt.toISOString() });
+      if (Object.prototype.hasOwnProperty.call(record, 'agentStates')) {
+        record.agentStates = expireAgentStates(record.agentStates, { nowMs: receivedAt.getTime() });
+      }
       await this.state.storage.put(`dev:${record.deviceId}`, record);
       this.broadcast('ingest').catch(() => {});
       return jsonResponse(200, { ok: true, deviceId: record.deviceId, stats: await this.statsWithSubscriptionVersion() });

@@ -7,6 +7,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 
 const { createHub, resolveBindHost } = require('../../src/hub/server');
+const { agentSessionKey } = require('../../src/shared/agentActivity');
 const { codexAccountKey } = require('../../src/shared/codexAuth');
 
 function tempDataFile() {
@@ -69,6 +70,157 @@ test('ingest inserts a device and is visible in getStats', () => {
     const record = hub.ingest({ deviceId: 'dev-a', today: { totalTokens: 5, costUsd: 0.1 } });
     assert.equal(record.deviceId, 'dev-a');
     assert.equal(hub.getStats().devices.length, 1);
+  } finally {
+    fs.rmSync(dataFile, { force: true });
+  }
+});
+
+test('hub ingests lifecycle replacement, omission preserve, clear, and aggregate TTL', () => {
+  const dataFile = tempDataFile();
+  const hub = createHub({ port: 0, host: '127.0.0.1', secret: '', staleAfterMs: 600_000, dataFile, logger: { error() {} } });
+  try {
+    hub.ingest({
+      deviceId: 'dev-a',
+      today: { totalTokens: 5 },
+      month: { totalTokens: 6 },
+      allTime: { totalTokens: 7 },
+      agentStates: [{
+        schemaVersion: 1,
+        harness: 'codex',
+        profile: 'work',
+        sessionId: agentSessionKey('codex', 'work', 's1'),
+        event: 'approval_requested',
+        observedAt: new Date().toISOString(),
+        fidelity: 'exact'
+      }]
+    });
+    assert.equal(hub.getStats().devices[0].agentStates[0].mode, 'waiting_for_input');
+    assert.equal(hub.getStats().agentActivity.mode, 'waiting_for_input');
+    assert.equal(hub.getStats().agentActivity.states[0].deviceId, 'dev-a');
+    assert.equal(Object.hasOwn(hub.getStats().devices[0].agentStates[0], 'deviceId'), false);
+
+    hub.ingest({ deviceId: 'dev-a', limitsOnly: true, limits: { providers: [] } });
+    assert.equal(hub.getStats().devices[0].agentStates.length, 1);
+    assert.equal(hub.getStats().devices[0].periods.allTime.totalTokens, 7);
+
+    hub.ingest({ deviceId: 'dev-a', agentStates: [] });
+    assert.deepEqual(hub.getStats().devices[0].agentStates, []);
+
+    hub.ingest({
+      deviceId: 'dev-b',
+      agentStates: [{
+        schemaVersion: 1,
+        harness: 'codex',
+        profile: 'work',
+        sessionId: agentSessionKey('codex', 'work', 'expired'),
+        event: 'turn_started',
+        observedAt: '2000-01-01T00:00:00.000Z',
+        fidelity: 'exact'
+      }]
+    });
+    assert.equal(hub.getStats().agentActivity.states.length, 0);
+  } finally {
+    fs.rmSync(dataFile, { force: true });
+  }
+});
+
+test('stats listeners receive lifecycle aggregate on ingest broadcast', () => {
+  const dataFile = tempDataFile();
+  const hub = createHub({ port: 0, host: '127.0.0.1', secret: '', dataFile, logger: { error() {} } });
+  try {
+    const seen = [];
+    hub.onStats((stats, reason) => seen.push({ stats, reason }));
+    hub.ingest({
+      deviceId: 'dev-a',
+      agentStates: [{
+        schemaVersion: 1,
+        harness: 'codex',
+        profile: 'work',
+        sessionId: agentSessionKey('codex', 'work', 's1'),
+        event: 'tool_started',
+        observedAt: new Date().toISOString(),
+        fidelity: 'exact'
+      }]
+    });
+
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].reason, 'ingest');
+    assert.equal(seen[0].stats.agentActivity.mode, 'tool_running');
+    assert.equal(seen[0].stats.agentActivity.states[0].deviceId, 'dev-a');
+  } finally {
+    fs.rmSync(dataFile, { force: true });
+  }
+});
+
+test('hub rejects raw and malformed lifecycle session identities at ingest', () => {
+  const dataFile = tempDataFile();
+  const hub = createHub({ port: 0, host: '127.0.0.1', secret: '', dataFile, logger: { error() {} } });
+  const baseState = {
+    schemaVersion: 1,
+    harness: 'codex',
+    profile: 'work',
+    event: 'turn_started',
+    observedAt: new Date().toISOString(),
+    fidelity: 'exact'
+  };
+  try {
+    for (const sessionId of [
+      'raw-session',
+      `sha256:${'a'.repeat(63)}`,
+      `sha256:${'A'.repeat(64)}`,
+      `sha256:${'g'.repeat(64)}`
+    ]) {
+      assert.throws(
+        () => hub.ingest({ deviceId: `dev-${sessionId.length}`, agentStates: [{ ...baseState, sessionId }] }),
+        /agentStates\.sessionId/
+      );
+    }
+    assert.equal(hub.getStats().devices.length, 0);
+  } finally {
+    fs.rmSync(dataFile, { force: true });
+  }
+});
+
+test('hub rejects future-invalid lifecycle states and drops expired states at ingest', () => {
+  const dataFile = tempDataFile();
+  const hub = createHub({ port: 0, host: '127.0.0.1', secret: '', dataFile, logger: { error() {} } });
+  const baseState = {
+    schemaVersion: 1,
+    harness: 'codex',
+    profile: 'work',
+    sessionId: agentSessionKey('codex', 'work', 's1'),
+    event: 'turn_started',
+    fidelity: 'exact'
+  };
+  try {
+    assert.throws(
+      () => hub.ingest({
+        deviceId: 'future',
+        agentStates: [{ ...baseState, observedAt: '2099-01-01T00:00:00.000Z' }]
+      }),
+      /agentStates\.observedAt/
+    );
+    assert.equal(hub.getDevices().length, 0);
+
+    assert.ok(hub.ingest({
+      deviceId: 'boundary',
+      agentStates: [{ ...baseState, observedAt: new Date(Date.now() + 30_000).toISOString() }]
+    }).agentStates.length);
+    assert.throws(
+      () => hub.ingest({
+        deviceId: 'beyond-boundary',
+        agentStates: [{ ...baseState, observedAt: new Date(Date.now() + 31_000).toISOString() }]
+      }),
+      /agentStates\.observedAt/
+    );
+    assert.equal(hub.getDevices().some((device) => device.deviceId === 'beyond-boundary'), false);
+
+    const expired = hub.ingest({
+      deviceId: 'expired',
+      agentStates: [{ ...baseState, observedAt: new Date(Date.now() - 61_000).toISOString() }]
+    });
+    assert.deepEqual(expired.agentStates, []);
+    assert.deepEqual(hub.getDevices().find((device) => device.deviceId === 'expired').agentStates, []);
   } finally {
     fs.rmSync(dataFile, { force: true });
   }

@@ -48,6 +48,42 @@ test('buffers limits until usage exists instead of emitting a zero-period record
   assert.deepEqual(emitted[0].meta, { revision: 1, source: 'usage', reason: 'startup', epoch: 7 });
 });
 
+test('agent states buffer until usage and later updates preserve usage and limits', () => {
+  const emitted = [];
+  const state = createDeviceState({ onRecord: (record, meta) => emitted.push({ record, meta }) });
+
+  assert.equal(state.updateAgentStates([{
+    schemaVersion: 1,
+    harness: 'codex',
+    profile: 'work',
+    sessionId: 's1',
+    event: 'turn_started',
+    observedAt: new Date().toISOString(),
+    fidelity: 'exact'
+  }], 'initial'), null);
+  assert.equal(emitted.length, 0);
+
+  state.updateUsage(usage(), 'startup');
+  state.updateLimits(limits(), 'scheduled');
+  const record = state.updateAgentStates([{
+    schemaVersion: 1,
+    harness: 'codex',
+    profile: 'work',
+    sessionId: 's1',
+    event: 'approval_requested',
+    observedAt: new Date().toISOString(),
+    fidelity: 'exact'
+  }], 'watch');
+
+  assert.equal(record.today.totalTokens, 10);
+  assert.equal(record.history.daily[0].tokens, 10);
+  assert.equal(record.limits.providers[0].provider, 'codex');
+  assert.equal(record.agentStates[0].mode, 'waiting_for_input');
+  assert.match(record.agentStates[0].sessionId, /^sha256:/);
+  assert.notEqual(record.agentStates[0].sessionId, 's1');
+  assert.equal(emitted.at(-1).meta.source, 'agent-states');
+});
+
 test('usage emits immediately and a later limits update emits a second full record', () => {
   const emitted = [];
   const state = createDeviceState({ onRecord: (record, meta) => emitted.push({ record, meta }) });
@@ -145,6 +181,7 @@ test('rejects stale epoch updates and stops publishing synchronously', () => {
 
   state.stop();
   assert.equal(state.updateLimits(limits(), 'late', { epoch: 4 }), null);
+  assert.equal(state.updateAgentStates([], 'late', { epoch: 4 }), null);
   assert.equal(state.updateUsage(usage(), 'late', { epoch: 4 }), null);
   assert.equal(emitted.length, 1);
 });

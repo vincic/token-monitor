@@ -14,6 +14,7 @@ function harness(options = {}) {
   let usageOptions;
   const usageOptionsHistory = [];
   let limitsDeps;
+  let agentOptions;
   const calls = [];
   const usageHandle = {
     getDiagnostics: () => ({ state: 'idle', lastTickSuccessAt: 'usage-time' }),
@@ -27,6 +28,10 @@ function harness(options = {}) {
     reconfigure: (...args) => { calls.push(['reconfigure', ...args]); return 'reconfigure'; },
     refresh: (...args) => { calls.push(['refresh', ...args]); return 'refresh'; },
     stop: () => calls.push(['limitsStop'])
+  };
+  const agentHandle = {
+    getDiagnostics: () => ({ enabled: true, states: 0 }),
+    stop: () => calls.push(['agentStop'])
   };
   const records = [];
   const runtime = createDeviceRuntime({
@@ -44,9 +49,13 @@ function harness(options = {}) {
       limitsDeps = nextDeps;
       return limitsHandle;
     },
+    createAgentStateRuntime(next) {
+      agentOptions = next;
+      return agentHandle;
+    },
     limitsDeps: injectedLimitsDeps
   });
-  return { calls, limitsDeps, records, runtime, usageOptions, usageOptionsHistory };
+  return { agentOptions, calls, limitsDeps, records, runtime, usageOptions, usageOptionsHistory };
 }
 
 test('usage publishes immediately without waiting for limits and late limits emit a second full record', () => {
@@ -69,6 +78,43 @@ test('limits arriving before first usage are buffered without fabricating a zero
   usageOptions.onUpdate({ updatedAt: 'usage-time', today: { totalTokens: 7 } }, 'startup');
   assert.equal(records.length, 1);
   assert.equal(records[0].record.limits.updatedAt, 'limits-time');
+});
+
+test('agent state updates buffer until baseline and preserve usage and limits', () => {
+  const { agentOptions, limitsDeps, records, usageOptions } = harness();
+  agentOptions.onUpdate([{
+    schemaVersion: 1,
+    harness: 'codex',
+    profile: 'work',
+    sessionId: 's1',
+    event: 'turn_started',
+    observedAt: new Date().toISOString(),
+    fidelity: 'exact'
+  }], 'initial');
+  assert.equal(records.length, 0);
+
+  usageOptions.onUpdate({
+    updatedAt: 'usage-time',
+    today: { totalTokens: 3 },
+    month: { totalTokens: 4 },
+    allTime: { totalTokens: 5 },
+    history: { daily: [{ date: '2026-08-31', totalTokens: 3 }] }
+  }, 'startup');
+  limitsDeps.onUpdate({ updatedAt: 'limits-time', refreshMs: 300000, providers: [] });
+  agentOptions.onUpdate([{
+    schemaVersion: 1,
+    harness: 'codex',
+    profile: 'work',
+    sessionId: 's1',
+    event: 'approval_requested',
+    observedAt: new Date().toISOString(),
+    fidelity: 'exact'
+  }], 'watch');
+
+  assert.equal(records.length, 3);
+  assert.equal(records.at(-1).record.today.totalTokens, 3);
+  assert.equal(records.at(-1).record.limits.updatedAt, 'limits-time');
+  assert.equal(records.at(-1).record.agentStates[0].mode, 'waiting_for_input');
 });
 
 test('initial limits seed composes with the first usage record', () => {
@@ -131,7 +177,7 @@ test('stop invalidates both producer callbacks before stopping handles', () => {
   usageOptions.onUpdate({ today: { totalTokens: 99 } }, 'late');
   limitsDeps.onUpdate({ providers: [] });
   assert.deepEqual(records, []);
-  assert.deepEqual(calls, [['usageStop'], ['limitsStop']]);
+  assert.deepEqual(calls, [['usageStop'], ['limitsStop'], ['agentStop']]);
 });
 
 test('usage reconfigure replaces only usage and rejects callbacks from the superseded runtime', () => {
@@ -261,7 +307,8 @@ test('runtime diagnostics proxy keeps usage and limits ownership separate', () =
   const { runtime } = harness();
   assert.deepEqual(runtime.getDiagnostics(), {
     usage: { state: 'idle', lastTickSuccessAt: 'usage-time' },
-    limits: { enabled: true, providers: [] }
+    limits: { enabled: true, providers: [] },
+    agentActivity: { enabled: true, states: 0 }
   });
   runtime.stop();
 });
@@ -278,5 +325,5 @@ test('runtime control wrappers do not delegate after stop', async () => {
   assert.equal(runtime.clearLimits({ provider: 'kimi' }, 'late'), null);
   await runtime.flush();
 
-  assert.deepEqual(calls, [['usageStop'], ['limitsStop']]);
+  assert.deepEqual(calls, [['usageStop'], ['limitsStop'], ['agentStop']]);
 });

@@ -4,6 +4,7 @@
 'use strict';
 
 const PERIODS = ['today', 'month', 'allTime'];
+const { aggregateAgentActivity, normalizeAgentStates, expireAgentStates } = require('./agentActivity');
 const { aggregateLimits, normalizeLimitsSummary } = require('./limits');
 const { normalizeClientHealth } = require('./clientHealth');
 const {
@@ -868,6 +869,7 @@ function normalizeDeviceRecord(record) {
     if (omitted) normalized.periodProjectsOmitted = omitted;
   }
   if (hasOwn(record, 'syncUploadIntervalMs')) normalized.syncUploadIntervalMs = normalizeSyncUploadIntervalMs(record.syncUploadIntervalMs);
+  if (hasOwn(record, 'agentStates')) normalized.agentStates = normalizeAgentStates(record.agentStates);
   if (hasOwn(record, 'historyAvailable')) normalized.historyAvailable = record.historyAvailable === true;
   if (hasOwn(record, 'history')) {
     // An explicit null means History is disabled/unavailable. Preserve that
@@ -1057,18 +1059,25 @@ function mergeDeviceRecord(existing, incoming) {
   const hasExisting = existing && typeof existing === 'object';
   const hasIncomingLimits = incoming && typeof incoming === 'object' && Object.prototype.hasOwnProperty.call(incoming, 'limits');
   const hasIncomingHistory = incoming && typeof incoming === 'object' && Object.prototype.hasOwnProperty.call(incoming, 'history');
+  const hasIncomingAgentStates = incoming && typeof incoming === 'object' && Object.prototype.hasOwnProperty.call(incoming, 'agentStates');
   const hasIncomingTrackedClients = hasOwn(incoming, 'trackedClients');
+  const hasIncomingUsage = incoming && typeof incoming === 'object'
+    && (hasOwn(incoming, 'today') || hasOwn(incoming, 'month') || hasOwn(incoming, 'allTime') || hasOwn(incoming, 'periods'));
   const normalizedIncoming = normalizeDeviceRecord(incoming || {});
   if (!hasExisting) return normalizedIncoming;
 
   const normalizedExisting = normalizeDeviceRecord(existing);
-  if (incoming?.limitsOnly === true) {
+  if (incoming?.limitsOnly === true || !hasIncomingUsage) {
     normalizedIncoming.periods = normalizedExisting.periods;
+    for (const key of ['hostname', 'platform', 'agentVersion', 'agentRuntime']) {
+      if (!hasOwn(incoming, key)) normalizedIncoming[key] = normalizedExisting[key];
+    }
     // The three attribution fields describe the usage this branch is carrying
     // forward, so they have to travel with it. Scoped to `limitsOnly` on
     // purpose: a full update from an agent too old to send them is stating that
     // it has no such data, and preserving them there would strand a permanently
     // stale diagnosis on a device that changed hands.
+    if (hasOwn(normalizedExisting, 'trackedClients') && !hasOwn(normalizedIncoming, 'trackedClients')) normalizedIncoming.trackedClients = normalizedExisting.trackedClients;
     if (hasOwn(normalizedExisting, 'clientStatus') && !hasOwn(normalizedIncoming, 'clientStatus')) normalizedIncoming.clientStatus = normalizedExisting.clientStatus;
     if (hasOwn(normalizedExisting, 'clientHealth') && !hasOwn(normalizedIncoming, 'clientHealth')) normalizedIncoming.clientHealth = normalizedExisting.clientHealth;
     if (hasOwn(normalizedExisting, 'wslStatus') && !hasOwn(normalizedIncoming, 'wslStatus')) normalizedIncoming.wslStatus = normalizedExisting.wslStatus;
@@ -1094,6 +1103,9 @@ function mergeDeviceRecord(existing, incoming) {
   if (!hasIncomingLimits) normalizedIncoming.limits = normalizedExisting.limits;
   else normalizedIncoming.limits = mergeDeviceLimits(normalizedExisting, normalizedIncoming);
   if (!hasIncomingHistory && hasOwn(normalizedExisting, 'history')) normalizedIncoming.history = normalizedExisting.history;
+  if (!hasIncomingAgentStates && hasOwn(normalizedExisting, 'agentStates')) {
+    normalizedIncoming.agentStates = expireAgentStates(normalizedExisting.agentStates);
+  }
   if (hasIncomingTrackedClients) {
     preserveUntrackedClientUsage(normalizedExisting, normalizedIncoming, normalizedIncoming.trackedClients || []);
   }
@@ -1304,10 +1316,13 @@ function aggregateDevices(devices, staleAfterMs, nowMs = Date.now()) {
   const now = nowMs;
   for (const record of devices) {
     const normalized = normalizeDeviceRecord(record);
+    const visibleAgentStates = hasOwn(normalized, 'agentStates')
+      ? expireAgentStates(normalized.agentStates, { nowMs: now })
+      : undefined;
     const ageMs = now - Date.parse(normalized.receivedAt || normalized.updatedAt || 0);
     const deviceStaleAfterMs = staleAfterMsForSyncUpload(normalized.syncUploadIntervalMs, staleAfterMs);
     const stale = Number.isFinite(ageMs) && deviceStaleAfterMs > 0 ? ageMs > deviceStaleAfterMs : false;
-    aggregate.devices.push({
+    const visibleDevice = {
       deviceId: normalized.deviceId,
       hostname: normalized.hostname,
       platform: normalized.platform,
@@ -1334,9 +1349,11 @@ function aggregateDevices(devices, staleAfterMs, nowMs = Date.now()) {
       ...(hasOwn(normalized, 'periodProjectsOmitted') ? { periodProjectsOmitted: normalized.periodProjectsOmitted } : {}),
       ...(hasOwn(normalized, 'syncUploadIntervalMs') ? { syncUploadIntervalMs: normalized.syncUploadIntervalMs } : {}),
       ...(hasOwn(normalized, 'periodWindows') ? { periodWindows: normalized.periodWindows } : {}),
+      ...(hasOwn(normalized, 'agentStates') ? { agentStates: visibleAgentStates } : {}),
       periods: normalized.periods,
       limits: normalized.limits
-    });
+    };
+    aggregate.devices.push(visibleDevice);
     if (
       normalized.allTimeProjectsOmitted === true
       || normalized.allTimeProjectsIncomplete === true
@@ -1356,6 +1373,7 @@ function aggregateDevices(devices, staleAfterMs, nowMs = Date.now()) {
     }
   }
   aggregate.limits = aggregateLimits(aggregate.devices, staleAfterMs, now);
+  aggregate.agentActivity = aggregateAgentActivity(aggregate.devices, { nowMs: now });
   if (Object.keys(sessionDetailsOmitted).length > 0) aggregate.sessionDetailsOmitted = sessionDetailsOmitted;
   if (Object.keys(periodProjectsOmitted).length > 0) aggregate.periodProjectsOmitted = periodProjectsOmitted;
   aggregate.devices.sort((a, b) => a.deviceId.localeCompare(b.deviceId));

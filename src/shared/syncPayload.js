@@ -1,6 +1,7 @@
 'use strict';
 
 const { MAX_JSON_BODY_BYTES } = require('./http');
+const { normalizeAgentStates } = require('./agentActivity');
 const { syncLimits } = require('./limits');
 const { isReasonixSyntheticSession } = require('./reasonixSessionGuard');
 
@@ -181,6 +182,7 @@ function buildSyncPayload(summary, {
 } = {}) {
   if (!summary || typeof summary !== 'object') return summary;
   const payload = { ...summary, limits: syncLimits(summary.limits) };
+  if (hasOwn(summary, 'agentStates')) payload.agentStates = normalizeAgentStates(summary.agentStates, { allowRawSessionId: true });
   if (summary.history && typeof summary.history === 'object') {
     payload.history = historyForSync(summary.history, summary.periodWindows);
     if (omitHistoryTokenComponents) {

@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const test = require('node:test');
+const { agentSessionKey } = require('../../src/shared/agentActivity');
 
 test('public stats periods strip every project identity field', async () => {
   const worker = await import(pathToFileURL(path.resolve(__dirname, '../../worker/src/index.js')).href);
@@ -127,6 +128,196 @@ test('Worker public stats carry no client health', async () => {
   const stats = await hub.statsWithSubscriptionVersion();
   assert.equal(stats.devices[0].clientHealth.clients.antigravity.overall, 'attention');
   assert.equal(Object.hasOwn(stats, 'clientHealth'), false);
+});
+
+test('Worker public stats strip agent lifecycle state and identities', async () => {
+  const worker = await import(pathToFileURL(path.resolve(__dirname, '../../worker/src/index.js')).href);
+  const now = new Date().toISOString();
+  const device = {
+    deviceId: 'macbook',
+    updatedAt: now,
+    receivedAt: now,
+    agentStates: [{
+      schemaVersion: 1,
+      harness: 'codex',
+      profile: 'work',
+      sessionId: agentSessionKey('codex', 'work', 'raw-session'),
+      event: 'approval_requested',
+      observedAt: now,
+      fidelity: 'exact'
+    }]
+  };
+  const hub = new worker.HubDO({
+    storage: {
+      async get(key) { throw new Error(`public stats must not read storage key: ${key}`); },
+      async list() { return new Map([['dev:macbook', device]]); }
+    }
+  }, { PUBLIC_STATS_ENABLED: '1' });
+
+  const payload = await (await hub.fetch(new Request('https://example.com/api/public/stats'))).json();
+  assert.equal(Object.hasOwn(payload, 'devices'), false);
+  assert.equal(Object.hasOwn(payload, 'agentActivity'), false);
+  const json = JSON.stringify(payload);
+  assert.doesNotMatch(json, /raw-session|approval_requested|sha256:/);
+});
+
+test('Worker authenticated stats expose lifecycle aggregate and device states', async () => {
+  const worker = await import(pathToFileURL(path.resolve(__dirname, '../../worker/src/index.js')).href);
+  const now = new Date().toISOString();
+  const device = {
+    deviceId: 'macbook',
+    updatedAt: now,
+    receivedAt: now,
+    agentStates: [{
+      schemaVersion: 1,
+      harness: 'codex',
+      profile: 'work',
+      sessionId: agentSessionKey('codex', 'work', 'raw-session'),
+      event: 'tool_started',
+      observedAt: now,
+      fidelity: 'exact'
+    }]
+  };
+  const hub = new worker.HubDO({
+    storage: {
+      async get() { return undefined; },
+      async list() { return new Map([['dev:macbook', device]]); }
+    }
+  }, { TOKEN_MONITOR_SECRET: 'shh' });
+
+  const payload = await (await hub.fetch(new Request('https://example.com/api/stats', {
+    headers: { authorization: 'Bearer shh' }
+  }))).json();
+  assert.equal(payload.agentActivity.mode, 'tool_running');
+  assert.equal(payload.agentActivity.states[0].deviceId, 'macbook');
+  assert.equal(payload.devices[0].agentStates[0].mode, 'tool_running');
+  assert.match(payload.devices[0].agentStates[0].sessionId, /^sha256:/);
+  assert.notEqual(payload.devices[0].agentStates[0].sessionId, 'raw-session');
+});
+
+test('Worker ingest rejects raw and malformed lifecycle session identities', async () => {
+  const worker = await import(pathToFileURL(path.resolve(__dirname, '../../worker/src/index.js')).href);
+  const hub = new worker.HubDO({
+    storage: {
+      async get() { return undefined; },
+      async list() { return new Map(); },
+      async put() { throw new Error('invalid lifecycle state must not be stored'); }
+    }
+  }, { TOKEN_MONITOR_SECRET: 'shh' });
+  const post = (sessionId) => hub.fetch(new Request('https://example.com/api/ingest', {
+    method: 'POST',
+    headers: { authorization: 'Bearer shh', 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deviceId: 'macbook',
+      agentStates: [{
+        schemaVersion: 1,
+        harness: 'codex',
+        profile: 'work',
+        sessionId,
+        event: 'turn_started',
+        observedAt: new Date().toISOString(),
+        fidelity: 'exact'
+      }]
+    })
+  }));
+
+  for (const sessionId of [
+    'raw-session',
+    `sha256:${'a'.repeat(63)}`,
+    `sha256:${'A'.repeat(64)}`,
+    `sha256:${'g'.repeat(64)}`
+  ]) {
+    const response = await post(sessionId);
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).message, /agentStates\.sessionId/);
+  }
+});
+
+test('Worker ingest rejects future-invalid lifecycle states and drops expired states', async () => {
+  const worker = await import(pathToFileURL(path.resolve(__dirname, '../../worker/src/index.js')).href);
+  const storage = new Map();
+  const hub = new worker.HubDO({
+    storage: {
+      async get(key) { return storage.get(key); },
+      async list() { return new Map(Array.from(storage.entries()).filter(([key]) => key.startsWith('dev:'))); },
+      async put(key, value) { storage.set(key, value); }
+    }
+  }, { TOKEN_MONITOR_SECRET: 'shh' });
+  const post = (observedAt, deviceId = 'macbook') => hub.fetch(new Request('https://example.com/api/ingest', {
+    method: 'POST',
+    headers: { authorization: 'Bearer shh', 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deviceId,
+      agentStates: [{
+        schemaVersion: 1,
+        harness: 'codex',
+        profile: 'work',
+        sessionId: agentSessionKey('codex', 'work', 's1'),
+        event: 'turn_started',
+        observedAt,
+        fidelity: 'exact'
+      }]
+    })
+  }));
+
+  let response = await post('2099-01-01T00:00:00.000Z', 'future');
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).message, /agentStates\.observedAt/);
+  assert.equal(storage.has('dev:future'), false);
+
+  response = await post(new Date(Date.now() + 30_000).toISOString(), 'boundary');
+  assert.equal(response.status, 200);
+  assert.equal(storage.get('dev:boundary').agentStates.length, 1);
+
+  response = await post(new Date(Date.now() + 31_000).toISOString(), 'beyond-boundary');
+  assert.equal(response.status, 400);
+  assert.equal(storage.has('dev:beyond-boundary'), false);
+
+  response = await post(new Date(Date.now() - 61_000).toISOString(), 'expired');
+  assert.equal(response.status, 200);
+  assert.deepEqual(storage.get('dev:expired').agentStates, []);
+});
+
+test('Worker ingest preserves omitted lifecycle state and clears explicit empty arrays', async () => {
+  const worker = await import(pathToFileURL(path.resolve(__dirname, '../../worker/src/index.js')).href);
+  const storage = new Map();
+  const hub = new worker.HubDO({
+    storage: {
+      async delete(key) { storage.delete(key); },
+      async get(key) { return storage.get(key); },
+      async list() { return new Map(Array.from(storage.entries()).filter(([key]) => key.startsWith('dev:'))); },
+      async put(key, value) { storage.set(key, value); }
+    }
+  }, { TOKEN_MONITOR_SECRET: 'shh' });
+  const post = (body) => hub.fetch(new Request('https://example.com/api/ingest', {
+    method: 'POST',
+    headers: { authorization: 'Bearer shh', 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  }));
+  const now = new Date().toISOString();
+
+  await post({
+    deviceId: 'macbook',
+    today: { totalTokens: 1 },
+    month: { totalTokens: 2 },
+    allTime: { totalTokens: 3 },
+    agentStates: [{
+      schemaVersion: 1,
+      harness: 'codex',
+      profile: 'work',
+      sessionId: agentSessionKey('codex', 'work', 's1'),
+      event: 'turn_started',
+      observedAt: now,
+      fidelity: 'exact'
+    }]
+  });
+  await post({ deviceId: 'macbook', limitsOnly: true, limits: { providers: [] } });
+  assert.equal((await hub.statsWithSubscriptionVersion()).devices[0].agentStates.length, 1);
+
+  await post({ deviceId: 'macbook', agentStates: [] });
+  const stats = await hub.statsWithSubscriptionVersion();
+  assert.deepEqual(stats.devices[0].agentStates, []);
+  assert.equal(stats.devices[0].periods.allTime.totalTokens, 3);
 });
 
 test('Worker authenticated stats expose the effective staleness threshold', async () => {

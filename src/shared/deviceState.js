@@ -2,6 +2,7 @@
 
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
 const { filterReasonixSyntheticSessions } = require('./reasonixSessionGuard');
+const { normalizeAgentStates } = require('./agentActivity');
 
 const PARTIAL_USAGE_CARRY_FIELDS = Object.freeze([
   'month',
@@ -84,6 +85,9 @@ function createDeviceState(options = {}) {
   const onRecord = typeof options.onRecord === 'function' ? options.onRecord : null;
   let usagePart = null;
   let limitsPart = hasOwn(options, 'initialLimits') ? cloneValue(options.initialLimits) : undefined;
+  let agentStatesPart = hasOwn(options, 'initialAgentStates')
+    ? normalizeAgentStates(options.initialAgentStates, { allowRawSessionId: true, ...(options.agentActivity || {}) })
+    : undefined;
   let currentRecord = null;
   let hasCompleteUsageBaseline = false;
   let revision = 0;
@@ -98,6 +102,7 @@ function createDeviceState(options = {}) {
     if (!usagePart || stopped) return null;
     const record = { ...cloneValue(usagePart), ...cloneValue(envelope) };
     if (limitsPart !== undefined) record.limits = cloneValue(limitsPart);
+    if (agentStatesPart !== undefined) record.agentStates = cloneValue(agentStatesPart);
     currentRecord = record;
     revision += 1;
     const meta = { revision, source, reason, epoch };
@@ -121,6 +126,12 @@ function createDeviceState(options = {}) {
     return publish('limits', reason);
   }
 
+  function updateAgentStates(states, reason = 'agent-states', meta = {}) {
+    if (!accepts(meta)) return null;
+    agentStatesPart = normalizeAgentStates(Array.isArray(states) ? states : [], { allowRawSessionId: true, ...(options.agentActivity || {}) });
+    return publish('agent-states', reason);
+  }
+
   function getSnapshot() {
     return currentRecord ? cloneValue(currentRecord) : null;
   }
@@ -132,6 +143,7 @@ function createDeviceState(options = {}) {
   return {
     getSnapshot,
     stop,
+    updateAgentStates,
     updateLimits,
     updateUsage
   };

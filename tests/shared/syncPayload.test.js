@@ -32,6 +32,58 @@ test('syncPayload carries OS version metadata to the hub', () => {
   assert.equal(payload.osVersion, '26.0');
 });
 
+test('syncPayload carries only bounded normalized agent lifecycle state', () => {
+  const observedAt = new Date().toISOString();
+  const payload = syncPayload({
+    deviceId: 'dev-a',
+    agentStates: [{
+      schemaVersion: 1,
+      harness: 'codex',
+      profile: 'work',
+      sessionId: 'raw-session-id',
+      event: 'turn_started',
+      observedAt,
+      fidelity: 'exact',
+      mode: 'blocked_error',
+      prompt: 'private prompt',
+      result: 'private result'
+    }]
+  });
+
+  assert.equal(payload.agentStates.length, 1);
+  assert.equal(payload.agentStates[0].mode, 'working');
+  assert.match(payload.agentStates[0].sessionId, /^sha256:/);
+  assert.notEqual(payload.agentStates[0].sessionId, 'raw-session-id');
+  assert.equal(Object.hasOwn(payload.agentStates[0], 'prompt'), false);
+  assert.equal(Object.hasOwn(payload.agentStates[0], 'result'), false);
+});
+
+test('syncPayload keeps bounded agent states from evicting core usage', () => {
+  const observedAt = new Date().toISOString();
+  const summary = {
+    deviceId: 'dev-a',
+    today: { totalTokens: 1, sessions: { keep: { totalTokens: 1 } } },
+    month: { totalTokens: 2, sessions: { keep: { totalTokens: 2 } } },
+    allTime: { totalTokens: 3, projects: { keep: { label: 'Keep', tokens: 3 } } },
+    agentStates: Array.from({ length: 200 }, (_, index) => ({
+      schemaVersion: 1,
+      harness: 'codex',
+      profile: 'work',
+      sessionId: `session-${index}`,
+      event: 'turn_started',
+      observedAt,
+      fidelity: 'exact'
+    }))
+  };
+
+  const { payload, bytes } = serializeSyncPayload(summary, { maxBytes: 12_000 });
+  assert.ok(bytes <= 12_000);
+  assert.equal(payload.today.totalTokens, 1);
+  assert.equal(payload.month.totalTokens, 2);
+  assert.equal(payload.allTime.totalTokens, 3);
+  assert.ok(payload.agentStates.length <= 32);
+});
+
 test('syncPayload bounds uploads by omitting all-time sessions', () => {
   const summary = {
     deviceId: 'dev-a',

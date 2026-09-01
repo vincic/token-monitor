@@ -4,6 +4,7 @@ const http = require('node:http');
 const path = require('node:path');
 const { URL } = require('node:url');
 const { aggregateDevices, mergeDeviceRecord, aggregateHistory } = require('../shared/usage');
+const { agentStatesFutureClockError, agentStatesWireIdentityError, expireAgentStates } = require('../shared/agentActivity');
 const { DEFAULT_STALE_AFTER_MS } = require('../shared/syncUploadInterval');
 const { deviceHistoryRevision, historyPreview, historyRevision } = require('../shared/history');
 const {
@@ -102,7 +103,23 @@ function createHub({
     if (!payload || (!payload.deviceId && !payload.id)) {
       throw new Error('deviceId_required');
     }
-    const record = mergeDeviceRecord(store.devices[String(payload.deviceId || payload.id)], { ...payload, receivedAt: new Date().toISOString() });
+    const receivedAt = new Date();
+    const identityError = agentStatesWireIdentityError(payload);
+    if (identityError) {
+      const error = new Error(identityError);
+      error.code = 'bad_agent_state_identity';
+      throw error;
+    }
+    const clockError = agentStatesFutureClockError(payload, { nowMs: receivedAt.getTime() });
+    if (clockError) {
+      const error = new Error(clockError);
+      error.code = 'bad_agent_state_clock';
+      throw error;
+    }
+    const record = mergeDeviceRecord(store.devices[String(payload.deviceId || payload.id)], { ...payload, receivedAt: receivedAt.toISOString() });
+    if (Object.prototype.hasOwnProperty.call(record, 'agentStates')) {
+      record.agentStates = expireAgentStates(record.agentStates, { nowMs: receivedAt.getTime() });
+    }
     store.devices[record.deviceId] = record;
     persist();
     broadcastStats('ingest');
@@ -226,6 +243,7 @@ function createHub({
           res.shouldKeepAlive = false;
           return sendJson(res, 413, { error: 'payload_too_large', message: error.message }, { connection: 'close' });
         }
+        if (error.code === 'bad_agent_state_identity') return sendJson(res, 400, { error: 'bad_request', message: error.message });
         return sendJson(res, 400, { error: 'bad_request', message: error.message });
       }
     }

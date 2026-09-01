@@ -397,6 +397,7 @@ test('unconfirmed forced termination releases the replacement barrier with a dia
       anchorPersistenceEnabled: false
     };
     runtime = createDeviceRuntime({
+      agentStateOptions: { enabled: false },
       usageOptions,
       onDiagnosticEvent: (event) => diagnostics.push(event)
     }, {

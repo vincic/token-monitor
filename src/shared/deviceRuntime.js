@@ -1,6 +1,7 @@
 'use strict';
 
 const { createDeviceState } = require('./deviceState');
+const { createAgentStateRuntime } = require('./agentStateRuntime');
 const { createLimitsRuntime } = require('./limitsRuntime');
 const { createUsageRuntime } = require('./usageRuntime');
 
@@ -10,6 +11,7 @@ const SUPERSEDED_USAGE_DIAGNOSTIC_CODES = new Set(['subprocess-termination-uncon
 function createDeviceRuntime(options = {}, deps = {}) {
   const epoch = nextRuntimeEpoch++;
   const makeDeviceState = deps.createDeviceState || createDeviceState;
+  const makeAgentStateRuntime = deps.createAgentStateRuntime || createAgentStateRuntime;
   const makeUsageRuntime = deps.createUsageRuntime || createUsageRuntime;
   const makeLimitsRuntime = deps.createLimitsRuntime || createLimitsRuntime;
   const sink = options.sink || null;
@@ -34,6 +36,9 @@ function createDeviceRuntime(options = {}, deps = {}) {
     envelope: options.envelope,
     ...(Object.prototype.hasOwnProperty.call(options, 'initialLimits')
       ? { initialLimits: options.initialLimits }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(options, 'initialAgentStates')
+      ? { initialAgentStates: options.initialAgentStates }
       : {}),
     onRecord(record, meta) {
       if (!active) return;
@@ -127,6 +132,22 @@ function createDeviceRuntime(options = {}, deps = {}) {
   let activeUsageOptions = options.usageOptions || {};
   let usageRuntime = makeUsageRuntime(usageRuntimeOptions(activeUsageOptions), deps.usageDeps || {});
   const limitsRuntime = makeLimitsRuntime(limitsOptions, limitsDeps);
+  const agentStateRuntime = options.agentStateOptions?.enabled === false ? null : makeAgentStateRuntime({
+    ...(options.agentStateOptions || {}),
+    onUpdate(states, reason) {
+      if (!active) return;
+      deviceState.updateAgentStates(states, reason, { epoch });
+    },
+    onDiagnosticEvent(event) {
+      if (!active) return;
+      try {
+        options.agentStateOptions?.onDiagnosticEvent?.(event);
+      } catch (error) {
+        try { options.onError?.(error, 'agent-state-diagnostic'); } catch (_) {}
+      }
+      forwardDiagnosticEvent(event);
+    }
+  }, deps.agentStateDeps || {});
 
   function reconfigureUsage(nextUsageOptions = {}) {
     if (!active) return null;
@@ -175,6 +196,7 @@ function createDeviceRuntime(options = {}, deps = {}) {
     deviceState.stop();
     usageRuntime?.stop?.(options);
     limitsRuntime?.stop?.();
+    agentStateRuntime?.stop?.();
     sink?.stop?.();
   }
 
@@ -185,7 +207,8 @@ function createDeviceRuntime(options = {}, deps = {}) {
     flush: () => active ? (sink?.flush?.() || Promise.resolve()) : Promise.resolve(),
     getDiagnostics: () => ({
       usage: usageRuntime?.getDiagnostics?.() ?? null,
-      limits: limitsRuntime?.getDiagnostics?.() ?? null
+      limits: limitsRuntime?.getDiagnostics?.() ?? null,
+      agentActivity: agentStateRuntime?.getDiagnostics?.() ?? null
     }),
     getSnapshot: () => deviceState.getSnapshot(),
     reconfigureUsage,

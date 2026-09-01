@@ -171,6 +171,20 @@ Example payload:
     "today": { "key": "2026-05-18", "endsAt": "2026-05-19T00:00:00.000Z" },
     "month": { "key": "2026-05", "endsAt": "2026-06-01T00:00:00.000Z" }
   },
+  "agentStates": [
+    {
+      "schemaVersion": 1,
+      "harness": "codex",
+      "profile": "work",
+      "sessionId": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "event": "tool_started",
+      "fidelity": "exact",
+      "toolName": "shell",
+      "surface": "terminal",
+      "adapterVersion": "0.1.0",
+      "observedAt": "2026-05-18T00:00:00.000Z"
+    }
+  ],
   "limits": {
     "updatedAt": "2026-05-18T00:00:00.000Z",
     "refreshMs": 300000,
@@ -233,6 +247,12 @@ Current agents and widgets include `osName` and, when known, `osVersion` so devi
 `syncUploadIntervalMs` is optional. A remote-hub widget includes `0` for live uploads or the selected fixed interval in milliseconds (`600000`, `1200000`, or `1800000`). The hub uses a positive interval to keep the device and its limits fresh for at least twice the upload interval; omitted or `0` values retain the configured `staleAfterMs` behavior. Local collection and embedded-host ingest remain live.
 
 `periodWindows` is optional. Agents and widgets stamp each snapshot with the UTC instant its `today`/`month` windows end, computed in the device's own local time (`endsAt` = next local midnight / next local month start; `key` is the device-local day/month for reference). New producers also include their IANA `timeZone`, which lets retained daily History keep using that device's calendar after it goes offline. The hub uses `endsAt` to expire a device's `today`/`month` from the native aggregate once `now >= endsAt`, so an offline device does not keep contributing a stale day/month snapshot (`allTime` never expires). Payloads without `periodWindows` fall back to a UTC day/month comparison against `updatedAt`; fixed History ranges fail closed after an unzoned producer window expires.
+
+`agentStates` is optional provider-neutral lifecycle state. It is a bounded device-local array of schema version 1 records with only these accepted input fields: `schemaVersion`, `harness`, `profile`, `sessionId`, `event`, `fidelity`, `toolName`, `surface`, `adapterVersion`, and `observedAt`. Producers that start with a raw provider session id must hash it before upload as `sha256:` over `harness`, `profile`, and the raw id; on the wire `sessionId` is valid only when it is exactly `sha256:` followed by 64 lowercase hexadecimal characters. Raw session ids, malformed `sha256:` values, prompts, messages, local paths, tool arguments, tool results, caller-provided `mode`, and producer-supplied `deviceId` are never part of the accepted wire contract. Unknown fields are discarded on ingest.
+
+Lifecycle `event` is one of `session_started`, `session_resumed`, `turn_started`, `tool_started`, `tool_finished`, `approval_requested`, `approval_resolved`, `turn_completed`, `session_ended`, `error`, or `heartbeat`. Adapters report events and `fidelity`; they do not choose `mode`. The shared mapper derives emitted `mode` every time from `event` and `fidelity`: `idle_ready`, `working`, `tool_running`, `waiting_for_input`, `blocked_error`, or `completed`, with aggregate priority `blocked_error > waiting_for_input > tool_running > working > completed > idle_ready`. Only `exact` events can produce `waiting_for_input` or `blocked_error`; `inferred` activity may produce `working`; `presence_only` never becomes an active mode.
+
+Lifecycle states have short independent TTLs: active modes expire after 60 seconds, and `completed` expires after 15 seconds. Omitted `agentStates` preserves the previous device states until those states expire. `agentStates: []` explicitly clears them. A present non-empty array replaces the previous lifecycle snapshot. Lifecycle-only records preserve the existing usage, History, limits, project, OS, and period-window fields; limits-only and History-less records likewise do not erase lifecycle state when the field is omitted. Older records that omit `agentStates` remain valid.
 
 `clientHealth` is optional per-client diagnostics: why a tracked tool shows the number it shows. It sits alongside the older `clientStatus` map (`active` / `waiting` / `missing` per client), which agents continue to send unchanged.
 
@@ -336,11 +356,12 @@ Response includes:
 - `historyPreview.daily[].activeTimeMs`, `historyPreview.monthly[].activeTimeMs`, and `historyPreview.summary.activeTimeMs` when tokscale graph exposes session active-time metrics
 - `historyRevision`, a compact invalidation hash for the aggregate History preview, and `deviceHistoryRevision`, a device-identity-aware hash used to invalidate per-device fixed-range caches when History ownership or availability changes
 - `limits.providers` aggregated by provider account
+- `agentActivity`, an authenticated bounded lifecycle aggregate with the highest-priority current `mode`, per-mode counts, and the normalized `states` that contributed to it. `states[].sessionId` is hashed and scoped by harness/profile, and `states[].deviceId` is added by the hub from the enclosing normalized device record so identical sessions on different devices remain distinct and routable. Raw provider session ids and producer-supplied device ids are never exposed.
 - `subscriptionsUpdatedAt`, the `updatedAt` of the hub's shared subscription list, or `""` if nothing has been written to it. The version only, never the records: a device compares it against the copy it holds and re-reads `/api/subscriptions` only when it has been overtaken. This is how an edit made on one device reaches the others, so a client that does not consult it will only see the shared list as it stood when it connected. Omitted from public Worker stats. An absent field means "no news" rather than an empty list.
-- `devices`, including each device's normalized `periods`, `limits`, `receivedAt`, `osName` / `osVersion` when reported, optional `syncUploadIntervalMs`, and optional `periodWindows`
+- `devices`, including each device's normalized `periods`, `limits`, `receivedAt`, `osName` / `osVersion` when reported, optional `syncUploadIntervalMs`, optional `periodWindows`, and optional bounded `agentStates`
 - stale status for devices that have not reported recently
 
-If multiple devices report the same provider account, the hub keeps the freshest valid limits status for that account. Public Worker stats omit account identifiers.
+If multiple devices report the same provider account, the hub keeps the freshest valid limits status for that account. Public Worker stats omit account identifiers, `devices`, `agentStates`, and `agentActivity`.
 
 ## `GET /api/devices`
 
