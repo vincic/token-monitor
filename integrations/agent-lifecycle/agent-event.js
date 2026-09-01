@@ -116,6 +116,20 @@ function validateExistingAncestors(root) {
   return true;
 }
 
+function createRootUnderValidatedAncestors(root) {
+  for (const candidate of existingPathComponents(root)) {
+    const existing = safeCall(() => fs.lstatSync(candidate), null);
+    if (existing) {
+      if (existing.isSymbolicLink?.() || !existing.isDirectory?.()) return false;
+      continue;
+    }
+    safeCall(() => fs.mkdirSync(candidate, { mode: 0o700 }), null);
+    const created = safeCall(() => fs.lstatSync(candidate), null);
+    if (!created || created.isSymbolicLink?.() || !created.isDirectory?.()) return false;
+  }
+  return true;
+}
+
 function rootIsSafe(root) {
   if (!validateExistingAncestors(root)) return false;
   const stat = safeCall(() => fs.lstatSync(root), null);
@@ -139,7 +153,7 @@ function fileName(harness, profile, sessionId) {
 
 function ensureRoot(root) {
   if (!safePath(root) || !validateExistingAncestors(root)) return false;
-  safeCall(() => fs.mkdirSync(root, { recursive: true, mode: 0o700 }), null);
+  if (!createRootUnderValidatedAncestors(root)) return false;
   return rootIsSafe(root);
 }
 

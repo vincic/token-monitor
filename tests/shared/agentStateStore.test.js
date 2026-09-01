@@ -44,17 +44,25 @@ function fakeStat({ type = 'dir', mode = 0o700, uid = 1000, size = 0 } = {}) {
   };
 }
 
-function fakeFsForRoot(root, { rootMode = 0o700, rootUid = 1000, rootType = 'dir', symlinkAncestor = '' } = {}) {
+function fakeFsForRoot(root, {
+  rootMode = 0o700,
+  rootUid = 1000,
+  rootType = 'dir',
+  symlinkAncestor = '',
+  ancestorMode = 0o700,
+  ancestorUid = 1000
+} = {}) {
   const resolvedRoot = path.resolve(root);
   const stats = new Map();
   const parsed = path.parse(resolvedRoot);
   let current = parsed.root;
-  stats.set(current, fakeStat());
-  for (const part of resolvedRoot.slice(parsed.root.length).split(path.sep).filter(Boolean)) {
+  stats.set(current, fakeStat({ mode: ancestorMode, uid: ancestorUid }));
+  const parts = resolvedRoot.slice(parsed.root.length).split(path.sep).filter(Boolean);
+  for (const part of parts.slice(0, -1)) {
     current = path.join(current, part);
-    stats.set(current, fakeStat({ type: current === symlinkAncestor ? 'symlink' : 'dir' }));
+    stats.set(current, fakeStat({ type: current === symlinkAncestor ? 'symlink' : 'dir', mode: ancestorMode, uid: ancestorUid }));
   }
-  stats.set(resolvedRoot, fakeStat({ type: rootType, mode: rootMode, uid: rootUid }));
+  if (rootType !== 'missing') stats.set(resolvedRoot, fakeStat({ type: rootType, mode: rootMode, uid: rootUid }));
   const files = new Map();
   return {
     chmods: [],
@@ -221,15 +229,28 @@ test('store refuses symlink roots and files', { skip: process.platform === 'win3
   assert.equal(safeStore.read({ nowMs: NOW }).length, 0);
 });
 
-test('store corrects a safely owned permissive existing root to owner-only mode', () => {
+test('store accepts macOS-style system-owned permissive ancestors when final root is private', () => {
+  const root = path.join(os.tmpdir(), 'tm-agent-state-macos-ancestor', 'agent-state');
+  const fsApi = fakeFsForRoot(root, { ancestorMode: 0o755, ancestorUid: 0, rootType: 'missing', rootUid: 501 });
+  const store = createAgentStateStore({ root, nowMs: NOW, fs: fsApi, getuid: () => 501, platform: 'darwin' });
+
+  const result = store.record(state());
+
+  assert.equal(result.ok, true);
+  assert.equal(fsApi.chmods.some((entry) => entry.path === path.resolve(root)), false);
+  assert.equal(fsApi.lstatSync(root).mode & 0o777, 0o700);
+  assert.equal(fsApi.lstatSync(root).uid, 501);
+});
+
+test('store refuses a permissive existing root without chmodding it', () => {
   const root = path.join(os.tmpdir(), 'tm-agent-state-owned');
   const fsApi = fakeFsForRoot(root, { rootMode: 0o755, rootUid: 1000 });
   const store = createAgentStateStore({ root, nowMs: NOW, fs: fsApi, getuid: () => 1000, platform: 'linux' });
 
   const result = store.record(state());
 
-  assert.equal(result.ok, true);
-  assert.ok(fsApi.chmods.some((entry) => entry.path === path.resolve(root) && entry.mode === 0o700));
+  assert.deepEqual(result, { ok: false, error: 'unsafe_root' });
+  assert.equal(fsApi.chmods.some((entry) => entry.path === path.resolve(root)), false);
 });
 
 test('store refuses a symlinked existing ancestor component', () => {

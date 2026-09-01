@@ -70,6 +70,20 @@ function validateExistingAncestors(fsApi, root) {
   return true;
 }
 
+function createRootUnderValidatedAncestors(fsApi, root) {
+  for (const candidate of existingPathComponents(root)) {
+    const existing = safeCall(() => fsApi.lstatSync(candidate), null);
+    if (existing) {
+      if (existing.isSymbolicLink?.() || !existing.isDirectory?.()) return false;
+      continue;
+    }
+    safeCall(() => fsApi.mkdirSync(candidate, { mode: 0o700 }), null);
+    const created = safeCall(() => fsApi.lstatSync(candidate), null);
+    if (!created || created.isSymbolicLink?.() || !created.isDirectory?.()) return false;
+  }
+  return true;
+}
+
 function rootIsSafe(fsApi, root, options = {}) {
   if (!validateExistingAncestors(fsApi, root)) return false;
   const stat = safeCall(() => fsApi.lstatSync(root), null);
@@ -83,15 +97,13 @@ function rootIsSafe(fsApi, root, options = {}) {
 
 function ensureRoot(fsApi, root, options = {}) {
   if (!validateExistingAncestors(fsApi, root)) return false;
-  safeCall(() => fsApi.mkdirSync(root, { recursive: true, mode: 0o700 }), null);
+  if (!createRootUnderValidatedAncestors(fsApi, root)) return false;
   const stat = safeCall(() => fsApi.lstatSync(root), null);
   if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) return false;
   if (isPosixPermissionsPlatform(options)) {
     const uid = currentUid(options);
     if (uid !== null && uid !== undefined && stat.uid !== uid) return false;
-    if ((modeBits(stat) & 0o077) !== 0) {
-      safeCall(() => fsApi.chmodSync(root, 0o700), null);
-    }
+    if ((modeBits(stat) & 0o077) !== 0) return false;
   }
   return rootIsSafe(fsApi, root, options);
 }

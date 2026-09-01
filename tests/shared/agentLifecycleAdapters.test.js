@@ -40,6 +40,10 @@ function tempRoot(name = 'tm-agent-life-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), name));
 }
 
+function missingTempStateRoot(name = 'tm-agent-life-state-') {
+  return path.join(os.tmpdir(), `${name}${process.pid}-${Math.random().toString(16).slice(2)}`, 'agent-state');
+}
+
 function payload(extra = {}) {
   return {
     session_id: 'session-a',
@@ -312,6 +316,22 @@ test('shared writer rejects unsafe root types and modes without chmodding target
   }
 });
 
+test('shared writer creates private final roots below permissive system ancestors', () => {
+  const root = missingTempStateRoot();
+  const script = path.join(process.cwd(), 'integrations', 'agent-lifecycle', 'agent-event.js');
+  const native = JSON.stringify({ sessionID: 'native-session-id', profile_name: 'work' });
+
+  const run = childProcess.spawnSync(process.execPath, [script, '--harness', 'codex', '--native-event', 'SessionStart', '--state-root', root, '--payload-json', native], {
+    encoding: 'utf8',
+    maxBuffer: 1024 * 64
+  });
+
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(run.stdout, '');
+  assert.equal(stateSummaries(root).length, 1);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(root).mode & 0o777, 0o700);
+});
+
 test('Claude install preserves existing hooks, backs up, is idempotent, and uninstalls only managed entries', () => {
   const homeDir = tempRoot();
   const settingsPath = path.join(homeDir, '.claude', 'settings.json');
@@ -479,7 +499,7 @@ test('OpenCode install refuses directory and symlink plugin destinations without
 test('OpenCode install renders configured default root and plugin writes there without env', async () => {
   const homeDir = tempRoot();
   const configDir = path.join(homeDir, 'oc');
-  const stateRoot = path.join(homeDir, 'custom-state');
+  const stateRoot = missingTempStateRoot('tm-agent-life-opencode-state-');
   const fallbackRoot = path.join(homeDir, 'fallback-state');
   const installed = installOpenCodeLifecycle({ opencodeConfigDir: configDir, opencodeVersion: '1.18.25', stateRoot });
   assert.equal(installed.ok, true);
@@ -509,6 +529,7 @@ test('OpenCode install renders configured default root and plugin writes there w
     else process.env.XDG_STATE_HOME = previousXdgState;
   }
   assert.equal(stateSummaries(stateRoot).length, 1);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(stateRoot).mode & 0o777, 0o700);
   assert.equal(fs.existsSync(path.join(fallbackRoot, 'token-monitor', 'agent-state')), false);
 });
 
@@ -819,7 +840,7 @@ print(json.dumps({"entries": entries, "event": state["event"]}))
 test('Hermes custom state root is persisted locally and used by package callbacks without env', () => {
   const homeDir = tempRoot();
   const hermesHome = path.join(homeDir, '.hermes');
-  const stateRoot = path.join(homeDir, 'custom-state');
+  const stateRoot = missingTempStateRoot('tm-agent-life-hermes-state-');
   const fallbackState = path.join(homeDir, 'fallback-state');
   const installed = installHermesLifecycle({
     hermesHome,
@@ -882,6 +903,7 @@ print(json.dumps({"files": sorted(path.name for path in Path(${JSON.stringify(st
   if (run.error?.code === 'ENOENT') return;
   assert.equal(run.status, 0, run.stderr);
   assert.equal(JSON.parse(run.stdout).files.length, 1);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(stateRoot).mode & 0o777, 0o700);
   assert.equal(fs.existsSync(path.join(fallbackState, 'token-monitor', 'agent-state')), false);
 });
 

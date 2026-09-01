@@ -92,6 +92,28 @@ def _validate_existing_ancestors(root):
     return True
 
 
+def _create_root_under_validated_ancestors(root):
+    for candidate in _existing_path_components(root):
+        try:
+            stat = candidate.lstat()
+        except FileNotFoundError:
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            except Exception:
+                return False
+            try:
+                stat = candidate.lstat()
+            except Exception:
+                return False
+        except Exception:
+            return False
+        if os.path.islink(candidate) or not candidate.is_dir():
+            return False
+    return True
+
+
 def _root_is_safe(root):
     if not _validate_existing_ancestors(root):
         return False
@@ -114,9 +136,7 @@ def _root_is_safe(root):
 def _ensure_root(root):
     if not _validate_existing_ancestors(root):
         return False
-    try:
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    except Exception:
+    if not _create_root_under_validated_ancestors(root):
         return False
     return _root_is_safe(root)
 

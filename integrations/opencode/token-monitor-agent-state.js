@@ -71,6 +71,20 @@ function validateExistingAncestors(dir) {
   return true;
 }
 
+function createRootUnderValidatedAncestors(dir) {
+  for (const candidate of existingPathComponents(dir)) {
+    const existing = safeCall(() => fs.lstatSync(candidate), null);
+    if (existing) {
+      if (existing.isSymbolicLink?.() || !existing.isDirectory?.()) return false;
+      continue;
+    }
+    safeCall(() => fs.mkdirSync(candidate, { mode: 0o700 }), null);
+    const created = safeCall(() => fs.lstatSync(candidate), null);
+    if (!created || created.isSymbolicLink?.() || !created.isDirectory?.()) return false;
+  }
+  return true;
+}
+
 function rootIsSafe(dir) {
   if (!validateExistingAncestors(dir)) return false;
   const stat = safeCall(() => fs.lstatSync(dir), null);
@@ -83,7 +97,7 @@ function rootIsSafe(dir) {
 
 function ensureRoot(dir) {
   if (!validateExistingAncestors(dir)) return false;
-  safeCall(() => fs.mkdirSync(dir, { recursive: true, mode: 0o700 }), null);
+  if (!createRootUnderValidatedAncestors(dir)) return false;
   return rootIsSafe(dir);
 }
 
