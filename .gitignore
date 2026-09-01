@@ -17,6 +17,8 @@ tmp/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+integrations/**/__pycache__/
+integrations/**/*.py[cod]
 .DS_Store
 Thumbs.db
 worker/.wrangler/

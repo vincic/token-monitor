@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const {
   agentSessionKey,
   expireAgentStates,
@@ -108,6 +109,21 @@ function ownedJsonFilePath(root, name) {
   return path.join(root, name);
 }
 
+function temporarySnapshotPath(root, name) {
+  const timeNs = typeof process.hrtime?.bigint === 'function' ? process.hrtime.bigint().toString() : `${Date.now()}000000`;
+  return path.join(root, `.${name}.${process.pid}.${timeNs}.${crypto.randomBytes(16).toString('hex')}.tmp`);
+}
+
+function cleanupLegacySnapshotTemps(fsApi, root, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const legacy = new RegExp(`^\\.${escaped}\\.${process.pid}(?:\\.\\d+)?\\.tmp$`);
+  const entries = safeCall(() => fsApi.readdirSync(root, { withFileTypes: true }), []);
+  for (const entry of entries) {
+    if (!entry.isFile() || !legacy.test(entry.name)) continue;
+    safeCall(() => fsApi.rmSync(path.join(root, entry.name), { force: true }), null);
+  }
+}
+
 function normalizeStoreDocument(value, options = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   if (value.storeVersion !== AGENT_STATE_STORE_VERSION) return null;
@@ -141,16 +157,19 @@ function createAgentStateStore(options = {}) {
     if (!filePath) return { ok: false, error: 'invalid_identity' };
     const existing = safeCall(() => fsApi.lstatSync(filePath), null);
     if (existing && (!existing.isFile() || existing.isSymbolicLink())) return { ok: false, error: 'unsafe_file' };
-    const temporary = path.join(root, `.${fileName}.${process.pid}.${Date.now()}.tmp`);
+    const temporary = temporarySnapshotPath(root, fileName);
     const body = `${JSON.stringify({ storeVersion: AGENT_STATE_STORE_VERSION, state: normalized })}\n`;
     try {
       fsApi.writeFileSync(temporary, body, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
       if (platform !== 'win32') safeCall(() => fsApi.chmodSync(temporary, 0o600), null);
       fsApi.renameSync(temporary, filePath);
+      cleanupLegacySnapshotTemps(fsApi, root, fileName);
       return { ok: true, filePath, state: normalized };
     } catch (error) {
       safeCall(() => fsApi.rmSync(temporary, { force: true }), null);
       return { ok: false, error: error.code || 'write_failed', message: error.message };
+    } finally {
+      safeCall(() => fsApi.rmSync(temporary, { force: true }), null);
     }
   }
 

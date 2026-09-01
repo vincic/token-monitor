@@ -1,0 +1,15 @@
+name: token-monitor-agent-state
+version: 2.0.0
+description: Token Monitor lifecycle state writer
+hooks:
+  - on_session_start
+  - on_session_reset
+  - on_session_end
+  - on_session_finalize
+  - pre_llm_call
+  - post_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - pre_approval_request
+  - post_approval_response
+  - api_request_error

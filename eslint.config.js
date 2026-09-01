@@ -43,6 +43,15 @@ module.exports = [
   },
 
   {
+    // OpenCode discovers JavaScript plugins as ESM factory modules.
+    files: ['integrations/opencode/token-monitor-agent-state.js'],
+    languageOptions: {
+      sourceType: 'module',
+      globals: { ...globals.node },
+    },
+  },
+
+  {
     // Adjust recommended rules to the codebase's intentional idioms
     rules: {
       // CLI/terminal output parsing legitimately needs ANSI (\x1b) and NUL (\x00)
