@@ -15,6 +15,7 @@ const {
   copyTemplate,
   doctorAgentLifecycle,
   ensureWriter,
+  hermesListShowsEnabled,
   hermesPluginDir,
   installClaudeLifecycle,
   installCodexLifecycle,
@@ -1047,6 +1048,14 @@ test('Hermes named profile path, enable commands, dry-run, rollback and coexiste
   assert.deepEqual(fs.readdirSync(path.join(hermesHome, 'profiles', 'research', 'plugins')).sort(), before);
 });
 
+test('Hermes plugin list parser accepts live plain rows and conservative legacy rows', () => {
+  assert.equal(hermesListShowsEnabled('enabled user 2.0.0 token-monitor-agent-state\n', 'token-monitor-agent-state'), true);
+  assert.equal(hermesListShowsEnabled('disabled user 2.0.0 token-monitor-agent-state\n', 'token-monitor-agent-state'), false);
+  assert.equal(hermesListShowsEnabled('token-monitor-agent-state enabled\n', 'token-monitor-agent-state'), true);
+  assert.equal(hermesListShowsEnabled('token-monitor-agent-state disabled\n', 'token-monitor-agent-state'), false);
+  assert.equal(hermesListShowsEnabled('enabled user 2.0.0 token-monitor-agent-state-extra\n', 'token-monitor-agent-state'), false);
+});
+
 test('copyTemplate dry-run and installs report byte-level idempotence', () => {
   const homeDir = tempRoot();
   const dest = path.join(homeDir, 'agent-event.js');
@@ -1225,7 +1234,7 @@ test('Hermes doctor lists enabled plugin and runs import diagnostics with discov
   fs.writeFileSync(python, '');
   const doctorRunner = (command, args) => {
     calls.push([command, args]);
-    if (command === 'hermes') return { status: 0, stdout: 'token-monitor-agent-state enabled\nherdr-agent-state enabled\n', stderr: '' };
+    if (command === 'hermes') return { status: 0, stdout: 'enabled user 2.0.0 token-monitor-agent-state\nenabled user 2.0.0 herdr-agent-state\n', stderr: '' };
     assert.equal(command, python);
     assert.equal(path.basename(args[0]), 'diagnostics.py');
     return { status: 0, stdout: JSON.stringify({ ok: true, declaredHooks: HERMES_HOOKS }) };
@@ -1235,8 +1244,10 @@ test('Hermes doctor lists enabled plugin and runs import diagnostics with discov
   assert.equal(doctor.results.length, 2);
   assert.equal(doctor.results.every((result) => result.capability === 'exact' && result.listedEnabled && result.diagnostic.ok), true);
   assert.equal(doctor.results.every((result) => result.configuredRoot === stateRoot && result.configuredRootMatches), true);
-  assert.ok(calls.some((call) => call[0] === 'hermes' && call[1].join(' ') === 'plugins list'));
-  assert.ok(calls.some((call) => call[0] === 'hermes' && call[1].join(' ') === '--profile research plugins list'));
+  assert.deepEqual(calls.filter((call) => call[0] === 'hermes' && call[1].includes('list')).map((call) => call[1]), [
+    ['plugins', 'list', '--plain', '--no-bundled'],
+    ['--profile', 'research', 'plugins', 'list', '--plain', '--no-bundled']
+  ]);
 
   const mismatch = doctorAgentLifecycle({ harnesses: ['hermes'], hermesHome, profiles: ['default'], hermesVersion: '0.20.5', commandRunner: doctorRunner, stateRoot: path.join(homeDir, 'other-state') });
   assert.equal(mismatch.ok, false);

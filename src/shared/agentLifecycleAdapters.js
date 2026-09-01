@@ -1119,7 +1119,8 @@ function hermesCommandArgs(action, profile) {
   const args = [];
   if (profile && profile !== 'default') args.push('--profile', profile);
   args.push('plugins', action);
-  if (action !== 'list') args.push('token-monitor-agent-state');
+  if (action === 'list') args.push('--plain', '--no-bundled');
+  else args.push('token-monitor-agent-state');
   return args;
 }
 
@@ -1477,9 +1478,22 @@ function uninstallAgentLifecycle(options = {}) {
 }
 
 function hermesListShowsEnabled(stdout, pluginName) {
-  const line = String(stdout || '').split(/\r?\n/).find((candidate) => candidate.includes(pluginName));
-  if (!line) return false;
-  return !/\b(disabled|false|off)\b/i.test(line) && /\b(enabled|true|on|\*)\b/i.test(line);
+  const target = String(pluginName || '').trim();
+  if (!target) return false;
+  for (const rawLine of String(stdout || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const fields = line.split(/\s+/);
+    if (fields.at(-1) === target) {
+      if (/^(disabled|false|off)$/i.test(fields[0])) return false;
+      if (/^(enabled|true|on|\*)$/i.test(fields[0])) return true;
+    }
+    if (!fields.includes(target)) continue;
+    const statusFields = fields.filter((field) => field !== target);
+    if (statusFields.some((field) => /^(disabled|false|off)$/i.test(field))) return false;
+    if (statusFields.some((field) => /^(enabled|true|on|\*)$/i.test(field))) return true;
+  }
+  return false;
 }
 
 function runDoctorHermesImport(options = {}) {
