@@ -14,6 +14,8 @@ const MANAGED_SIGNATURE = 'token-monitor-agent-lifecycle:v1';
 const MANAGED_OWNER = 'Token Monitor agent lifecycle';
 const MAX_NATIVE_PAYLOAD_BYTES = 1024 * 1024;
 const MAX_CONFIGURED_STATE_ROOT_CHARS = 4096;
+const CODEX_APP_SERVER_TIMEOUT_MS = 5000;
+const CODEX_MANAGED_TRUST_ENTRY_LIMIT = 64;
 const HERMES_HOOKS = Object.freeze([
   'on_session_start',
   'on_session_reset',
@@ -781,27 +783,48 @@ function tomlString(value) {
   return JSON.stringify(rejectUnsafeShellArg(value));
 }
 
+function tomlLiteralString(value) {
+  const text = rejectUnsafeShellArg(value);
+  if (text.includes("'''")) throw new Error('TOML literal strings cannot contain three consecutive apostrophes');
+  return `'''${text}'''`;
+}
+
+function codexHookStateKey(nativeEvent, outerIndex, hookIndex) {
+  return `${nativeEvent}.${outerIndex}.${hookIndex}`;
+}
+
+function codexManagedTrustEntryComment(entry) {
+  const event = compactString(entry?.event, 128);
+  const command = compactString(entry?.command, 4096);
+  const key = compactString(entry?.key, 4096);
+  if (!event || !command || !key || !CODEX_HOOK_EVENTS.includes(event)) return '';
+  return `# tokenMonitorTrustEntry = ${JSON.stringify({ event, command, key })}`;
+}
+
 function codexManagedBlock(options = {}) {
   const blocks = [];
   for (const nativeEvent of CODEX_HOOK_EVENTS) {
+    const command = writerCommand('codex', nativeEvent, options);
     blocks.push(
       `[[hooks.${nativeEvent}]]`,
-      `command = ${tomlString(options.nodePath || process.execPath)}`,
-      `args = [${[
-        options.writerPath || defaultWriterPath(options),
-        '--harness',
-        'codex',
-        '--native-event',
-        nativeEvent,
-        ...(options.stateRoot ? ['--state-root', options.stateRoot] : []),
-        ...(options.profile ? ['--profile', options.profile] : [])
-      ].map((value) => tomlString(String(value))).join(', ')}]`,
+      'matcher = "*"',
+      `tokenMonitorManaged = ${tomlString(MANAGED_SIGNATURE)}`,
+      `tokenMonitorOwner = ${tomlString(MANAGED_OWNER)}`,
+      `tokenMonitorEvent = ${tomlString(nativeEvent)}`,
+      `[[hooks.${nativeEvent}.hooks]]`,
+      'type = "command"',
+      'async = false',
+      `command = ${tomlLiteralString(command)}`,
+      `tokenMonitorManaged = ${tomlString(MANAGED_SIGNATURE)}`,
+      `tokenMonitorOwner = ${tomlString(MANAGED_OWNER)}`,
+      `tokenMonitorEvent = ${tomlString(nativeEvent)}`,
       ''
     );
   }
   return [
     `# >>> ${MANAGED_SIGNATURE}`,
     `# owner = ${MANAGED_OWNER}`,
+    ...(Array.isArray(options.trustEntries) ? options.trustEntries.map(codexManagedTrustEntryComment).filter(Boolean).slice(0, CODEX_MANAGED_TRUST_ENTRY_LIMIT) : []),
     ...blocks,
     `# <<< ${MANAGED_SIGNATURE}`
   ].join('\n');
@@ -811,11 +834,238 @@ function stripCodexManagedBlock(toml) {
   return String(toml || '').replace(new RegExp(`\\n?# >>> ${MANAGED_SIGNATURE}[\\s\\S]*?# <<< ${MANAGED_SIGNATURE}\\n?`, 'g'), '\n').replace(/\n{3,}/g, '\n\n');
 }
 
+function stripCodexManagedTrustState(toml, keys) {
+  const managedKeys = new Set(keys || []);
+  if (!managedKeys.size) return String(toml || '');
+  const lines = String(toml || '').split(/\r?\n/);
+  const kept = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const stateKey = parseCodexTrustStateHeader(stripTomlComment(line));
+    if (!stateKey || !managedKeys.has(stateKey)) {
+      kept.push(line);
+      continue;
+    }
+    index += 1;
+    while (index < lines.length && !/^\s*\[/.test(lines[index])) index += 1;
+    index -= 1;
+  }
+  return kept.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
+function parseTomlScalar(value) {
+  const text = String(value || '').trim();
+  if (text.startsWith("'''") && text.endsWith("'''")) return text.slice(3, -3);
+  if (text.startsWith('"') && text.endsWith('"')) return parseTomlBasicStringLiteral(text);
+  if (text.startsWith("'") && text.endsWith("'")) return text.slice(1, -1);
+  if (text === 'true') return true;
+  if (text === 'false') return false;
+  return '';
+}
+
+function parseTomlBasicString(value) {
+  const parsed = parseTomlScalar(value);
+  return typeof parsed === 'string' ? parsed : '';
+}
+
+function decodeTomlBasicStringAt(text, startIndex = 0) {
+  if (text[startIndex] !== '"') return null;
+  let value = '';
+  for (let index = startIndex + 1; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === '"') return { value, endIndex: index };
+    if (char !== '\\') {
+      if (char.charCodeAt(0) < 0x20) return null;
+      value += char;
+      continue;
+    }
+    index += 1;
+    if (index >= text.length) return null;
+    const escaped = text[index];
+    if (escaped === 'b') value += '\b';
+    else if (escaped === 't') value += '\t';
+    else if (escaped === 'n') value += '\n';
+    else if (escaped === 'f') value += '\f';
+    else if (escaped === 'r') value += '\r';
+    else if (escaped === '"') value += '"';
+    else if (escaped === '\\') value += '\\';
+    else if (escaped === 'u' || escaped === 'U') {
+      const length = escaped === 'u' ? 4 : 8;
+      const hex = text.slice(index + 1, index + 1 + length);
+      if (!new RegExp(`^[0-9A-Fa-f]{${length}}$`).test(hex)) return null;
+      const codePoint = Number.parseInt(hex, 16);
+      if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) return null;
+      value += String.fromCodePoint(codePoint);
+      index += length;
+    } else {
+      return null;
+    }
+  }
+  return null;
+}
+
+function parseTomlBasicStringLiteral(text) {
+  const value = String(text || '').trim();
+  const decoded = decodeTomlBasicStringAt(value, 0);
+  return decoded && decoded.endIndex === value.length - 1 ? decoded.value : '';
+}
+
+function parseCodexTrustStateHeader(line) {
+  const text = String(line || '').trim();
+  const prefix = '[hooks.state.';
+  if (!text.startsWith(prefix) || !text.endsWith(']')) return '';
+  const decoded = decodeTomlBasicStringAt(text, prefix.length);
+  if (!decoded || decoded.endIndex !== text.length - 2) return '';
+  return decoded.value;
+}
+
+function parseCodexManagedHooks(toml) {
+  const lines = String(toml || '').split(/\r?\n/);
+  const sections = [];
+  let current = null;
+  let currentHook = null;
+  const eventCounts = new Map();
+  for (const rawLine of lines) {
+    const line = stripTomlComment(rawLine).trim();
+    if (!line) continue;
+    let match = line.match(/^\[\[hooks\.([A-Za-z][A-Za-z0-9_]*)\]\]$/);
+    if (match) {
+      const event = match[1];
+      const outerIndex = eventCounts.get(event) || 0;
+      eventCounts.set(event, outerIndex + 1);
+      current = { event, outerIndex, matcher: '', tokenMonitorManaged: '', tokenMonitorOwner: '', tokenMonitorEvent: '', hooks: [] };
+      sections.push(current);
+      currentHook = null;
+      continue;
+    }
+    match = line.match(/^\[\[hooks\.([A-Za-z][A-Za-z0-9_]*)\.hooks\]\]$/);
+    if (match) {
+      const event = match[1];
+      if (!current || current.event !== event) {
+        const outerIndex = eventCounts.get(event) || 0;
+        eventCounts.set(event, outerIndex + 1);
+        current = { event, outerIndex, matcher: '', tokenMonitorManaged: '', tokenMonitorOwner: '', tokenMonitorEvent: '', hooks: [] };
+        sections.push(current);
+      }
+      currentHook = { hookIndex: current.hooks.length, type: '', async: null, command: '', tokenMonitorManaged: '', tokenMonitorOwner: '', tokenMonitorEvent: '' };
+      current.hooks.push(currentHook);
+      continue;
+    }
+    if (!current) continue;
+    const equalsIndex = line.indexOf('=');
+    if (equalsIndex <= 0) continue;
+    const key = line.slice(0, equalsIndex).trim();
+    const value = parseTomlScalar(line.slice(equalsIndex + 1));
+    if (value === '') continue;
+    const target = currentHook || current;
+    if (key === 'async' && currentHook) {
+      target.async = value;
+    } else if (['matcher', 'type', 'command', 'tokenMonitorManaged', 'tokenMonitorOwner', 'tokenMonitorEvent'].includes(key)) {
+      target[key] = value;
+    }
+  }
+  return sections.flatMap((section) => section.hooks.map((hook) => ({
+    event: section.event,
+    outerIndex: section.outerIndex,
+    hookIndex: hook.hookIndex,
+    stateKey: codexHookStateKey(section.event, section.outerIndex, hook.hookIndex),
+    matcher: section.matcher,
+    command: hook.command,
+    type: hook.type,
+    async: hook.async,
+    tokenMonitorManaged: hook.tokenMonitorManaged || section.tokenMonitorManaged,
+    tokenMonitorOwner: hook.tokenMonitorOwner || section.tokenMonitorOwner,
+    tokenMonitorEvent: hook.tokenMonitorEvent || section.tokenMonitorEvent
+  }))).filter((hook) => hook.tokenMonitorManaged === MANAGED_SIGNATURE);
+}
+
+function parseCodexManagedTrustEntries(toml) {
+  const entries = [];
+  const text = String(toml || '');
+  const blockPattern = new RegExp(`# >>> ${MANAGED_SIGNATURE}[\\s\\S]*?# <<< ${MANAGED_SIGNATURE}`, 'g');
+  for (const blockMatch of text.matchAll(blockPattern)) {
+    const lines = blockMatch[0].split(/\r?\n/);
+    for (const line of lines) {
+      if (entries.length >= CODEX_MANAGED_TRUST_ENTRY_LIMIT) return entries;
+      const match = line.match(/^\s*#\s*tokenMonitorTrustEntry\s*=\s*(\{.*\})\s*$/);
+      if (!match) continue;
+      let value;
+      try {
+        value = JSON.parse(match[1]);
+      } catch (_) {
+        continue;
+      }
+      const event = compactString(value?.event, 128);
+      const command = compactString(value?.command, 4096);
+      const key = compactString(value?.key, 4096);
+      if (!event || !command || !key || !CODEX_HOOK_EVENTS.includes(event)) continue;
+      entries.push({ event, command, key });
+    }
+  }
+  return entries;
+}
+
+function parseCodexManagedTrustKeys(toml) {
+  return [...new Set(parseCodexManagedTrustEntries(toml).map((entry) => entry.key))];
+}
+
+function parseCodexTrustedHookState(toml) {
+  const lines = String(toml || '').split(/\r?\n/);
+  const state = new Map();
+  let currentKey = '';
+  for (const rawLine of lines) {
+    const line = stripTomlComment(rawLine).trim();
+    if (!line) continue;
+    const sectionKey = parseCodexTrustStateHeader(line);
+    if (sectionKey) {
+      currentKey = sectionKey;
+      continue;
+    }
+    if (/^\s*\[/.test(line)) currentKey = '';
+    if (!currentKey) continue;
+    const match = line.match(/^trusted_hash\s*=\s*(.+)$/);
+    if (match) {
+      const value = parseTomlBasicString(match[1]);
+      if (value) state.set(currentKey, value);
+    }
+  }
+  return state;
+}
+
+function codexTrustStateBlock(trustByKey) {
+  const lines = [];
+  for (const [key, hash] of [...trustByKey.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    lines.push(`[hooks.state.${tomlString(key)}]`, `trusted_hash = ${tomlString(hash)}`, '');
+  }
+  return lines.join('\n').trimEnd();
+}
+
+function tomlLiteralEndIndex(text, startIndex) {
+  let index = startIndex + 3;
+  while (index < text.length) {
+    if (text[index] !== "'") {
+      index += 1;
+      continue;
+    }
+    let end = index + 1;
+    while (end < text.length && text[end] === "'") end += 1;
+    if (end - index >= 3) return end - 1;
+    index = end;
+  }
+  return -1;
+}
+
 function stripTomlComment(line) {
   let quote = '';
   let escaped = false;
   for (let index = 0; index < line.length; index += 1) {
     const char = line[index];
+    if (!quote && line.slice(index, index + 3) === "'''") {
+      const end = tomlLiteralEndIndex(line, index);
+      if (end < 0) return line;
+      index = end;
+      continue;
+    }
     if (quote === '"') {
       if (escaped) escaped = false;
       else if (char === '\\') escaped = true;
@@ -840,6 +1090,12 @@ function tomlQuotesBalanced(text) {
   let escaped = false;
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
+    if (!quote && text.slice(index, index + 3) === "'''") {
+      const end = tomlLiteralEndIndex(text, index);
+      if (end < 0) return false;
+      index = end;
+      continue;
+    }
     if (quote === '"') {
       if (escaped) escaped = false;
       else if (char === '\\') escaped = true;
@@ -862,6 +1118,12 @@ function bracketBalanceOk(text) {
   let escaped = false;
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
+    if (!quote && text.slice(index, index + 3) === "'''") {
+      const end = tomlLiteralEndIndex(text, index);
+      if (end < 0) return false;
+      index = end;
+      continue;
+    }
     if (quote === '"') {
       if (escaped) escaped = false;
       else if (char === '\\') escaped = true;
@@ -890,6 +1152,12 @@ function unquotedTomlCompoundDelta(text) {
   let escaped = false;
   for (let index = 0; index < text.length; index += 1) {
     const char = text[index];
+    if (!quote && text.slice(index, index + 3) === "'''") {
+      const end = tomlLiteralEndIndex(text, index);
+      if (end < 0) return 1;
+      index = end;
+      continue;
+    }
     if (quote === '"') {
       if (escaped) escaped = false;
       else if (char === '\\') escaped = true;
@@ -910,9 +1178,48 @@ function unquotedTomlCompoundDelta(text) {
   return delta;
 }
 
+function tomlSectionHeaderLineOk(line) {
+  const text = String(line || '').trim();
+  if (!text.startsWith('[') || !text.endsWith(']')) return false;
+  let quote = '';
+  let escaped = false;
+  let depth = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (!quote && text.slice(index, index + 3) === "'''") {
+      const end = tomlLiteralEndIndex(text, index);
+      if (end < 0) return false;
+      index = end;
+      continue;
+    }
+    if (quote === '"') {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') quote = '';
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") quote = '';
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === '[') depth += 1;
+    else if (char === ']') {
+      depth -= 1;
+      if (depth < 0) return false;
+      if (depth === 0 && index !== text.length - 1) return false;
+    }
+  }
+  return depth === 0 && quote === '' && !escaped;
+}
+
 function validateCodexTomlParseable(content) {
   const text = String(content || '');
-  if (!tomlQuotesBalanced(text) || !bracketBalanceOk(text)) {
+  const uncommented = text.split(/\r?\n/).map(stripTomlComment).join('\n');
+  if (!tomlQuotesBalanced(uncommented) || !bracketBalanceOk(uncommented)) {
     return { ok: false, code: 'invalid_toml', message: 'Codex config is not valid TOML' };
   }
   const lines = text.split(/\r?\n/);
@@ -924,7 +1231,7 @@ function validateCodexTomlParseable(content) {
       compoundDepth += unquotedTomlCompoundDelta(line);
       continue;
     }
-    if (/^\[\[[^\]]+\]\]$/.test(line) || /^\[[^\]]+\]$/.test(line)) continue;
+    if (tomlSectionHeaderLineOk(line)) continue;
     const equalsIndex = line.indexOf('=');
     if (equalsIndex <= 0 || equalsIndex === line.length - 1) {
       return { ok: false, code: 'invalid_toml', message: `Codex config is not valid TOML near line ${index + 1}` };
@@ -945,6 +1252,311 @@ function readCodexConfigForInstall(configPath) {
   return { ...config, path: parent.destination };
 }
 
+function parseCodexAppServerResponse(output, protocol = {}) {
+  if (typeof protocol.parseHookListResponse === 'function') return protocol.parseHookListResponse(output);
+  const hookListResponseId = protocol.hookListResponseId || 2;
+  const candidates = [];
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const text = line.trim();
+    if (!text) continue;
+    try {
+      candidates.push(JSON.parse(text));
+    } catch (_) {}
+  }
+  if (!candidates.length) {
+    try {
+      candidates.push(JSON.parse(String(output || '').trim()));
+    } catch (_) {}
+  }
+  const response = candidates.find((candidate) => candidate && candidate.id === hookListResponseId);
+  if (!response && protocol.requireHookListResponseId) return null;
+  return response?.result || response?.hooks || response?.items || response?.data || response || null;
+}
+
+function parseCodexAppServerHookListResult(output, protocol = {}) {
+  try {
+    const parsed = parseCodexAppServerResponse(output, protocol);
+    if (!parsed || typeof parsed !== 'object') return { ok: false, code: 'trust_discovery_no_response' };
+    return { ok: true, parsed };
+  } catch (error) {
+    return { ok: false, code: 'trust_discovery_parse_failed', reason: error.message };
+  }
+}
+
+function codexAppServerTerminationMetadata(result) {
+  if (!result) return {};
+  const metadata = {};
+  if (result.error) {
+    metadata.warning = result.error.code === 'ETIMEDOUT'
+      ? 'codex_app_server_timed_out_after_response'
+      : 'codex_app_server_terminated_after_response';
+    metadata.terminatedAfterResponse = true;
+    metadata.terminationCode = result.error.code || result.error.name || 'error';
+    if (result.error.message) metadata.terminationReason = result.error.message;
+  } else if (result.status !== 0) {
+    metadata.warning = 'codex_app_server_exited_after_response';
+    metadata.terminatedAfterResponse = true;
+    metadata.terminationCode = result.status === null || result.status === undefined ? 'unknown' : String(result.status);
+  }
+  return metadata;
+}
+
+function flattenCodexHookList(value, entries = []) {
+  if (!value || typeof value !== 'object') return entries;
+  if (Array.isArray(value)) {
+    for (const item of value) flattenCodexHookList(item, entries);
+    return entries;
+  }
+  const command = typeof value.command === 'string'
+    ? value.command
+    : (typeof value.config?.command === 'string' ? value.config.command : '');
+  const currentHash = firstString(value.currentHash, value.current_hash, value.hash, value.commandHash, value.command_hash);
+  const key = firstString(value.key, value.hookKey, value.hook_key, value.stateKey, value.state_key, value.id);
+  if (command || currentHash || key) entries.push({ command, currentHash, key, raw: value });
+  for (const childKey of ['data', 'hooks', 'items', 'entries', 'providers', 'events', 'commands', 'children']) {
+    flattenCodexHookList(value[childKey], entries);
+  }
+  return entries;
+}
+
+function selectCodexManagedTrustEntries(entries, managedHooks) {
+  const commandToHook = new Map();
+  for (const hook of managedHooks) {
+    if (!hook.command || commandToHook.has(hook.command)) continue;
+    commandToHook.set(hook.command, hook);
+  }
+  const byCommand = new Map();
+  const incomplete = [];
+  let duplicateCount = 0;
+  for (const entry of entries) {
+    const hook = commandToHook.get(entry.command);
+    if (!hook) continue;
+    const selected = {
+      event: hook.event,
+      command: entry.command,
+      key: entry.key,
+      currentHash: entry.currentHash
+    };
+    if (!selected.key || !selected.currentHash) {
+      incomplete.push(selected);
+      continue;
+    }
+    const existing = byCommand.get(selected.command);
+    if (!existing) {
+      byCommand.set(selected.command, selected);
+      continue;
+    }
+    if (existing.key === selected.key && existing.currentHash === selected.currentHash) {
+      duplicateCount += 1;
+      continue;
+    }
+    return {
+      ok: false,
+      code: 'trust_discovery_conflict',
+      reason: 'Codex hooks/list returned conflicting Token Monitor hook entries for the same managed command.',
+      command: selected.command,
+      conflicts: [existing, selected]
+    };
+  }
+  const missingCommands = [...commandToHook.keys()].filter((command) => !byCommand.has(command));
+  if (missingCommands.length || incomplete.length) {
+    return {
+      ok: false,
+      code: 'trust_discovery_incomplete',
+      reason: 'Codex hooks/list did not return a current hash for every Token Monitor hook command.',
+      missingCommands,
+      incompleteCount: incomplete.length,
+      selectedCount: byCommand.size
+    };
+  }
+  return {
+    ok: true,
+    entries: [...byCommand.values()],
+    selectedCount: byCommand.size,
+    duplicateCount
+  };
+}
+
+function codexHookTrustRequest(protocol = {}) {
+  if (typeof protocol.hookListRequest === 'function') return protocol.hookListRequest();
+  const cwds = Array.isArray(protocol.cwds) ? protocol.cwds : [];
+  return [
+    { jsonrpc: '2.0', id: 1, method: 'initialize', params: { clientInfo: { name: 'SidePulse Token Monitor', version: AGENT_LIFECYCLE_ADAPTER_VERSION }, capabilities: null } },
+    { jsonrpc: '2.0', method: 'initialized', params: {} },
+    { jsonrpc: '2.0', id: 2, method: 'hooks/list', params: { cwds } }
+  ].map((message) => JSON.stringify(message)).join('\n') + '\n';
+}
+
+function codexHookTrustCwds(options = {}) {
+  const candidates = [
+    options.cwd,
+    process.cwd(),
+    options.codexConfigPath ? path.dirname(options.codexConfigPath) : ''
+  ];
+  const cwds = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string' || !candidate) continue;
+    let resolved;
+    try {
+      resolved = path.resolve(candidate);
+      if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) continue;
+    } catch (_) {
+      continue;
+    }
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    cwds.push(resolved);
+  }
+  return cwds;
+}
+
+function discoverCodexHookTrust(options = {}, managedHooks = []) {
+  const commands = new Set(managedHooks.map((hook) => hook.command).filter(Boolean));
+  if (!commands.size) return { ok: false, code: 'no_managed_hooks', trustConfigured: false, reason: 'No managed Codex hook commands were found in the written config.' };
+  if (typeof options.codexHookTrustDiscovery === 'function') {
+    return options.codexHookTrustDiscovery({ commands, managedHooks, options });
+  }
+  const runner = commandRunner(options);
+  const command = options.codexCommand || 'codex';
+  const protocol = { cwds: codexHookTrustCwds(options), ...(options.codexAppServerProtocol || {}) };
+  let result;
+  try {
+    result = runner(command, ['app-server', '--stdio'], {
+      input: codexHookTrustRequest(protocol),
+      encoding: 'utf8',
+      env: options.env || process.env,
+      timeout: options.codexAppServerTimeoutMs || CODEX_APP_SERVER_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024
+    });
+  } catch (error) {
+    return { ok: false, code: 'trust_discovery_failed', trustConfigured: false, reason: error.message };
+  }
+  const terminated = Boolean(result && (result.error || result.status !== 0));
+  const parsed = parseCodexAppServerHookListResult(
+    result?.stdout,
+    terminated ? { ...protocol, requireHookListResponseId: true } : protocol
+  );
+  if (parsed.ok) {
+    const entries = flattenCodexHookList(parsed.parsed);
+    const selected = selectCodexManagedTrustEntries(entries.filter((entry) => commands.has(entry.command)), managedHooks);
+    if (!selected.ok) return { ...selected, trustConfigured: false };
+    const trustByKey = new Map();
+    for (const entry of selected.entries) trustByKey.set(entry.key, entry.currentHash);
+    return {
+      ok: true,
+      code: 'ok',
+      trustConfigured: true,
+      trustByKey,
+      trustEntries: selected.entries,
+      selectedCount: selected.selectedCount,
+      duplicateCount: selected.duplicateCount,
+      ...codexAppServerTerminationMetadata(result)
+    };
+  }
+  if (!result || result.error || result.status !== 0) {
+    return {
+      ok: false,
+      code: result?.error ? 'codex_app_server_unavailable' : 'codex_app_server_failed',
+      trustConfigured: false,
+      reason: commandOutput(result) || result?.error?.message || 'Codex app-server hooks/list failed.'
+    };
+  }
+  return {
+    ok: false,
+    code: parsed.code,
+    trustConfigured: false,
+    reason: parsed.reason || 'Codex app-server hooks/list did not return a complete response.'
+  };
+}
+
+function configureCodexHookTrust(toml, options = {}) {
+  const managedHooks = parseCodexManagedHooks(toml);
+  const discovery = discoverCodexHookTrust(options, managedHooks);
+  if (!discovery.ok) return discovery;
+  const previousTrustKeys = Array.isArray(options.previousTrustKeys) ? options.previousTrustKeys : parseCodexManagedTrustKeys(toml);
+  const withoutManagedTrust = stripCodexManagedTrustState(
+    stripCodexManagedBlock(toml),
+    [...previousTrustKeys, ...discovery.trustByKey.keys()]
+  ).trimEnd();
+  const managedBlock = codexManagedBlock({ ...options, trustEntries: discovery.trustEntries });
+  const trustBlock = codexTrustStateBlock(discovery.trustByKey);
+  return {
+    ok: true,
+    code: 'ok',
+    trustConfigured: true,
+    content: [withoutManagedTrust, managedBlock, trustBlock].filter(Boolean).join('\n\n').trimEnd() + '\n',
+    trustedKeys: [...discovery.trustByKey.keys()].sort(),
+    selectedCount: discovery.selectedCount,
+    warning: discovery.warning,
+    terminatedAfterResponse: discovery.terminatedAfterResponse,
+    terminationCode: discovery.terminationCode,
+    terminationReason: discovery.terminationReason
+  };
+}
+
+function analyzeCodexHooks(config, options = {}) {
+  const writerPath = options.writerPath || defaultWriterPath(options);
+  const managedHooks = parseCodexManagedHooks(config);
+  const trustedState = parseCodexTrustedHookState(config);
+  const managedTrustEntries = parseCodexManagedTrustEntries(config);
+  const events = [];
+  let managedOccurrenceCount = 0;
+  for (const nativeEvent of CODEX_HOOK_EVENTS) {
+    const expectedCommand = writerCommand('codex', nativeEvent, { ...options, writerPath });
+    const commands = managedHooks.filter((hook) => hook.event === nativeEvent);
+    managedOccurrenceCount += commands.length;
+    const correctHooks = commands.filter((hook) => (
+      hook.type === 'command'
+      && hook.async === false
+      && hook.command === expectedCommand
+      && hook.tokenMonitorOwner === MANAGED_OWNER
+      && hook.tokenMonitorEvent === nativeEvent
+    ));
+    const matchingTrustEntries = managedTrustEntries.filter((entry) => (
+      entry.event === nativeEvent
+      && entry.command === expectedCommand
+      && trustedState.has(entry.key)
+    ));
+    const trusted = correctHooks.length > 0 && matchingTrustEntries.length > 0;
+    const trustedKeys = matchingTrustEntries.map((entry) => entry.key);
+    const wrongCommand = commands.some((hook) => (
+      hook.tokenMonitorOwner === MANAGED_OWNER
+      && hook.tokenMonitorEvent === nativeEvent
+      && hook.command !== expectedCommand
+    ));
+    events.push({
+      event: nativeEvent,
+      ok: correctHooks.length > 0,
+      trusted,
+      managed: commands.length > 0,
+      wrongCommand,
+      expectedCommand,
+      trustedKeys
+    });
+  }
+  const missingEvents = events.filter((event) => !event.managed).map((event) => event.event);
+  const partialEvents = events.filter((event) => event.managed && !event.ok).map((event) => event.event);
+  const wrongCommandEvents = events.filter((event) => event.wrongCommand).map((event) => event.event);
+  const untrustedEvents = events.filter((event) => event.ok && !event.trusted).map((event) => event.event);
+  const configuredEvents = events.filter((event) => event.ok).map((event) => event.event);
+  const trustedEvents = events.filter((event) => event.trusted).map((event) => event.event);
+  return {
+    complete: events.every((event) => event.ok),
+    trusted: events.every((event) => event.trusted),
+    configuredEvents,
+    trustedEvents,
+    missingEvents,
+    partialEvents,
+    wrongCommandEvents,
+    untrustedEvents,
+    managedOccurrenceCount,
+    managedHooks,
+    managedTrustEntries,
+    events
+  };
+}
+
 function installCodexLifecycle(options = {}) {
   const homeDir = options.homeDir || os.homedir();
   const configPath = options.codexConfigPath || path.join(homeDir, '.codex', 'config.toml');
@@ -954,16 +1566,47 @@ function installCodexLifecycle(options = {}) {
   if (!config.ok) return { ok: false, harness: 'codex', code: config.code, path: config.path || configPath, message: config.message };
   const writeConfigPath = config.path || configPath;
   const existing = config.exists ? config.content : '';
+  const previousTrustKeys = parseCodexManagedTrustKeys(existing);
   const writer = ensureWriter(options);
   if (writer.ok === false) return { ok: false, harness: 'codex', code: writer.code, writerPath: writer.destination, collision: writer.collision };
-  const next = `${stripCodexManagedBlock(upsertFeatureHooks(existing)).trimEnd()}\n\n${codexManagedBlock({ ...options, writerPath: writer.destination })}\n`;
+  const baseWithoutManagedTrust = stripCodexManagedTrustState(
+    stripCodexManagedBlock(upsertFeatureHooks(existing)),
+    previousTrustKeys
+  ).trimEnd();
+  const next = `${baseWithoutManagedTrust}\n\n${codexManagedBlock({ ...options, writerPath: writer.destination })}\n`;
   if (existing !== next) backupExisting(writeConfigPath, options);
   if (!options.dryRun) {
     fs.mkdirSync(path.dirname(writeConfigPath), { recursive: true, mode: 0o700 });
     fs.writeFileSync(writeConfigPath, next, { encoding: 'utf8', mode: 0o600 });
     if (process.platform !== 'win32') fs.chmodSync(writeConfigPath, 0o600);
   }
-  return { ok: true, harness: 'codex', configPath, writerPath: writer.destination, changed: existing !== next || writer.changed, version: support.version, dryRun: Boolean(options.dryRun), forced: !support.exact };
+  let finalContent = next;
+  let trust = { ok: false, trustConfigured: false, code: 'dry_run', reason: 'Dry run does not query Codex app-server.' };
+  if (!options.dryRun) {
+    trust = configureCodexHookTrust(next, { ...options, writerPath: writer.destination, previousTrustKeys });
+    if (trust.ok && trust.content !== next) {
+      finalContent = trust.content;
+      fs.writeFileSync(writeConfigPath, finalContent, { encoding: 'utf8', mode: 0o600 });
+      if (process.platform !== 'win32') fs.chmodSync(writeConfigPath, 0o600);
+    }
+  }
+  return {
+    ok: true,
+    harness: 'codex',
+    configPath,
+    writerPath: writer.destination,
+    changed: existing !== finalContent || writer.changed,
+    version: support.version,
+    dryRun: Boolean(options.dryRun),
+    forced: !support.exact,
+    trustConfigured: Boolean(trust.trustConfigured),
+    trustCode: trust.code,
+    trustReason: trust.trustConfigured ? undefined : trust.reason,
+    trustWarning: trust.warning,
+    trustTerminatedAfterResponse: trust.terminatedAfterResponse,
+    trustTerminationCode: trust.terminationCode,
+    trustedKeys: trust.trustedKeys || []
+  };
 }
 
 function uninstallCodexLifecycle(options = {}) {
@@ -976,7 +1619,8 @@ function uninstallCodexLifecycle(options = {}) {
   if (!config.ok) return { ok: false, harness: 'codex', code: config.code, path: configPath };
   if (!config.exists) return { ok: true, harness: 'codex', changed: false };
   const existing = config.content;
-  const next = stripCodexManagedBlock(existing);
+  const managedTrustKeys = parseCodexManagedTrustKeys(existing);
+  const next = stripCodexManagedTrustState(stripCodexManagedBlock(existing), managedTrustKeys);
   const changed = next !== existing;
   if (changed) {
     backupExisting(writeConfigPath, options);
@@ -1374,14 +2018,16 @@ function doctorAgentLifecycle(options = {}) {
     const configPath = options.codexConfigPath || path.join(homeDir, '.codex', 'config.toml');
     const configFile = safeReadRegularFile(configPath);
     const config = configFile.ok && configFile.exists ? configFile.content : '';
-    const installed = config.includes(MANAGED_SIGNATURE);
-    const managedHooks = CODEX_HOOK_EVENTS.filter((event) => config.includes(`[[hooks.${event}]]`));
-    const hooksEnabled = /^\s*hooks\s*=\s*true\s*$/m.test(config);
     const writerPath = options.writerPath || defaultWriterPath(options);
+    const hookStatus = analyzeCodexHooks(config, { ...options, writerPath });
+    const installed = hookStatus.complete;
+    const hasManagedPresence = hookStatus.managedOccurrenceCount > 0;
+    const hooksEnabled = /^\s*hooks\s*=\s*true\s*$/m.test(config);
     const writerPresent = safeFilePresent(writerPath);
+    const exact = support.exact && installed && hookStatus.trusted && hooksEnabled && writerPresent;
     results.push({
       harness: 'codex',
-      capability: support.exact && installed && hooksEnabled && managedHooks.length === CODEX_HOOK_EVENTS.length && writerPresent ? 'exact' : 'presence_only',
+      capability: exact ? 'exact' : (hasManagedPresence ? 'presence_only' : 'not_configured'),
       reason: support.reason,
       version: support.version,
       configPath,
@@ -1389,7 +2035,16 @@ function doctorAgentLifecycle(options = {}) {
       code: configFile.ok ? undefined : configFile.code,
       installed,
       hooksEnabled,
-      managedHooks,
+      hooksConfigured: hookStatus.complete,
+      managedHooks: hookStatus.configuredEvents,
+      configuredEvents: hookStatus.configuredEvents,
+      trustedEvents: hookStatus.trustedEvents,
+      missingEvents: hookStatus.missingEvents,
+      partialEvents: hookStatus.partialEvents,
+      wrongCommandEvents: hookStatus.wrongCommandEvents,
+      untrustedEvents: hookStatus.untrustedEvents,
+      trustConfigured: hookStatus.trusted,
+      trustRepairAction: hookStatus.trusted ? undefined : 'Run the Token Monitor Codex install command again after Codex is available so it can query app-server hooks/list and write current hook hashes.',
       writerPath,
       writerPresent,
       stateRoot,
@@ -1574,9 +2229,13 @@ module.exports = {
   MANAGED_OWNER,
   MANAGED_SIGNATURE,
   MAX_NATIVE_PAYLOAD_BYTES,
+  analyzeCodexHooks,
   codexHookSupport,
+  codexManagedBlock,
+  configureCodexHookTrust,
   copyTemplate,
   defaultWriterPath,
+  discoverCodexHookTrust,
   discoverHermesPython,
   doctorAgentLifecycle,
   ensureWriter,
@@ -1595,6 +2254,9 @@ module.exports = {
   mapOpenCodeLifecycleEvent,
   opencodeSupport,
   probeCommandVersion,
+  parseCodexManagedHooks,
+  parseCodexManagedTrustEntries,
+  parseCodexTrustedHookState,
   runDoctorHermesImport,
   runHermesPluginCommand,
   shellQuote,

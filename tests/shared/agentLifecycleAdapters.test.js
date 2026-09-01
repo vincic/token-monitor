@@ -9,6 +9,7 @@ const test = require('node:test');
 const { pathToFileURL } = require('node:url');
 
 const {
+  analyzeCodexHooks,
   CLAUDE_HOOK_EVENTS,
   CODEX_HOOK_EVENTS,
   HERMES_HOOKS,
@@ -25,6 +26,9 @@ const {
   mapCodexLifecycleEvent,
   mapHermesLifecycleEvent,
   mapOpenCodeLifecycleEvent,
+  parseCodexManagedHooks,
+  parseCodexManagedTrustEntries,
+  parseCodexTrustedHookState,
   runDoctorHermesImport,
   shellQuote,
   uninstallClaudeLifecycle,
@@ -90,6 +94,15 @@ function makeFileSymlink(t, target, link) {
     throw error;
   }
   return true;
+}
+
+function codexAppServerKey(configPath, hook) {
+  return `${configPath}:hooks.${hook.event}[${hook.outerIndex}].hooks[${hook.hookIndex}]`;
+}
+
+function codexEscapedAppServerKey(hook) {
+  const event = hook.event === 'SessionStart' ? 'session_start' : hook.event;
+  return `C:\\Users\\me\\.codex\\config.toml:${event}:1:${hook.hookIndex}`;
 }
 
 function runInstalledHermesDiagnostic(t, options = {}) {
@@ -409,23 +422,530 @@ test('Claude doctor reports not_configured when no managed hook or writer is pre
   assert.equal(result.results[0].installed, false);
 });
 
-test('Codex install preserves TOML, enables hooks once, and removes only managed block', () => {
+test('Codex install writes native nested hooks, preserves unrelated state, and trusts only Token Monitor commands', () => {
   const homeDir = tempRoot();
   const configPath = path.join(homeDir, '.codex', 'config.toml');
+  const writerPath = path.join(homeDir, 'agent event.js');
+  const stateRoot = path.join(homeDir, 'state');
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  fs.writeFileSync(configPath, 'model = "gpt-5"\n\n[features]\nexperimental = true\nhooks = false\n');
+  fs.writeFileSync(configPath, [
+    'model = "gpt-5"',
+    '',
+    '[[hooks.SessionStart]]',
+    'matcher = "*"',
+    '[[hooks.SessionStart.hooks]]',
+    'type = "command"',
+    'command = "sidepulse"',
+    '',
+    '[features]',
+    'experimental = true',
+    'hooks = false',
+    '',
+    '[hooks.state."sidepulse.SessionStart.0.0"]',
+    'trusted_hash = "sidepulse-hash"',
+    '',
+    '[hooks.state."SessionStart.0.0"]',
+    'trusted_hash = "unrelated-index-hash"',
+    ''
+  ].join('\n'));
 
-  assert.equal(installCodexLifecycle({ homeDir, codexConfigPath: configPath, version: '0.150.1', stateRoot: path.join(homeDir, 'state') }).ok, true);
+  const commandRunner = (command, args, runOptions) => {
+    assert.equal(command, 'codex');
+    assert.deepEqual(args, ['app-server', '--stdio']);
+    assert.doesNotMatch(runOptions.input, /dangerously-bypass-hook-trust/);
+    const requests = runOptions.input.trim().split(/\n/).map((line) => JSON.parse(line));
+    assert.deepEqual(requests.map((request) => ({ id: request.id, method: request.method })), [
+      { id: 1, method: 'initialize' },
+      { id: undefined, method: 'initialized' },
+      { id: 2, method: 'hooks/list' }
+    ]);
+    assert.equal(requests[0].params.clientInfo.name, 'SidePulse Token Monitor');
+    assert.equal(requests[0].params.clientInfo.version, '2.0.0');
+    assert.equal(requests[0].params.capabilities, null);
+    assert.deepEqual(requests[1].params, {});
+    assert.ok(requests[2].params.cwds.includes(process.cwd()));
+    assert.ok(requests[2].params.cwds.includes(path.dirname(configPath)));
+    const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
+    return {
+      status: 0,
+      stdout: [
+        'stderr-like non-json line',
+        JSON.stringify({ jsonrpc: '2.0', method: 'window/logMessage', params: { message: 'ignored notification' } }),
+        JSON.stringify({ jsonrpc: '2.0', id: 1, result: { capabilities: { ignored: true } } }),
+        JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        result: {
+          data: [
+            { cwd: homeDir, hooks: [{ key: 'sidepulse.SessionStart.0.0', command: 'sidepulse', currentHash: 'new-sidepulse-hash' }] },
+            { cwd: process.cwd(), hooks: managed.map((hook) => ({ key: codexAppServerKey(configPath, hook), command: hook.command, current_hash: `hash-${hook.event}` })) },
+            { cwd: '/tmp/other', hooks: [{ key: 'other.PostToolUse.2.0', command: 'other-command', currentHash: 'other-hash' }] }
+          ]
+        }
+      })
+      ].join('\n') + '\n'
+    };
+  };
+
+  const result = installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
+  assert.equal(result.ok, true);
+  assert.equal(result.trustConfigured, true);
   const installed = fs.readFileSync(configPath, 'utf8');
   assert.match(installed, /model = "gpt-5"/);
   assert.match(installed, /\[features\]\nhooks = true\nexperimental = true/);
-  assert.match(installed, new RegExp(`command = ${JSON.stringify(process.execPath).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.match(installed, /command = '''/);
+  assert.doesNotMatch(installed, /^\s*args\s*=/m);
+  assert.doesNotMatch(installed, /dangerously-bypass-hook-trust/);
   assert.equal((installed.match(/hooks = true/g) || []).length, 1);
-  assert.ok(CODEX_HOOK_EVENTS.every((event) => installed.includes(`[[hooks.${event}]]`)));
+  assert.ok(CODEX_HOOK_EVENTS.every((event) => installed.includes(`[[hooks.${event}]]\nmatcher = "*"`)));
+  assert.ok(CODEX_HOOK_EVENTS.every((event) => installed.includes(`[[hooks.${event}.hooks]]\ntype = "command"\nasync = false\ncommand = '''`)));
+  assert.match(installed, /\[hooks\.state\."sidepulse\.SessionStart\.0\.0"\]\ntrusted_hash = "sidepulse-hash"/);
+  assert.match(installed, /\[hooks\.state\."SessionStart\.0\.0"\]\ntrusted_hash = "unrelated-index-hash"/);
+  assert.doesNotMatch(installed, /new-sidepulse-hash|other-hash/);
+  const trust = parseCodexTrustedHookState(installed);
+  const managed = parseCodexManagedHooks(installed);
+  const managedTrustEntries = parseCodexManagedTrustEntries(installed);
+  assert.equal(managed.length, CODEX_HOOK_EVENTS.length);
+  assert.equal(managedTrustEntries.length, CODEX_HOOK_EVENTS.length);
+  assert.equal(managed.every((hook) => hook.command === writerCommand('codex', hook.event, { writerPath, stateRoot })), true);
+  assert.equal(managed.every((hook) => hook.async === false), true);
+  assert.equal(CODEX_HOOK_EVENTS.every((event) => {
+    const hook = managed.find((candidate) => candidate.event === event);
+    const exactKey = codexAppServerKey(configPath, hook);
+    return trust.get(exactKey) === `hash-${event}` && managedTrustEntries.some((entry) => entry.event === event && entry.key === exactKey && entry.command === hook.command);
+  }), true);
+  assert.equal(managed.some((hook) => trust.has(hook.stateKey)), false);
+
+  const doctor = doctorAgentLifecycle({ harnesses: ['codex'], homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath });
+  assert.equal(doctor.ok, true);
+  assert.equal(doctor.results[0].capability, 'exact');
+  assert.deepEqual(doctor.results[0].untrustedEvents, []);
+
+  const analyzed = analyzeCodexHooks(installed, { writerPath, stateRoot });
+  assert.equal(analyzed.complete, true);
+  assert.equal(analyzed.trusted, true);
 
   assert.equal(installCodexLifecycle({ homeDir, codexConfigPath: configPath, version: '0.1.0' }).ok, false);
   assert.equal(uninstallCodexLifecycle({ homeDir, codexConfigPath: configPath }).changed, true);
-  assert.doesNotMatch(fs.readFileSync(configPath, 'utf8'), /token-monitor-agent-lifecycle/);
+  const uninstalled = fs.readFileSync(configPath, 'utf8');
+  assert.doesNotMatch(uninstalled, /token-monitor-agent-lifecycle/);
+  assert.match(uninstalled, /command = "sidepulse"/);
+  assert.match(uninstalled, /\[hooks\.state\."sidepulse\.SessionStart\.0\.0"\]\ntrusted_hash = "sidepulse-hash"/);
+  assert.match(uninstalled, /\[hooks\.state\."SessionStart\.0\.0"\]\ntrusted_hash = "unrelated-index-hash"/);
+});
+
+test('Codex trust discovery accepts duplicate identical app-server hook entries for multiple cwds', () => {
+  const homeDir = tempRoot();
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+  const writerPath = path.join(homeDir, 'agent-event.js');
+  const stateRoot = path.join(homeDir, 'state');
+  const commandRunner = () => {
+    const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
+    const hooks = managed.map((hook) => ({ key: codexAppServerKey(configPath, hook), command: hook.command, currentHash: `hash-${hook.event}` }));
+    return {
+      status: 0,
+      stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { data: [{ cwd: homeDir, hooks }, { cwd: process.cwd(), hooks }] } })}\n`
+    };
+  };
+
+  const result = installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.trustConfigured, true);
+  assert.equal(result.trustedKeys.length, CODEX_HOOK_EVENTS.length);
+  const trust = parseCodexTrustedHookState(fs.readFileSync(configPath, 'utf8'));
+  assert.equal(trust.size, CODEX_HOOK_EVENTS.length);
+});
+
+test('Codex trust discovery accepts complete hooks/list stdout before app-server timeout', () => {
+  const homeDir = tempRoot();
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+  const writerPath = path.join(homeDir, 'agent-event.js');
+  const stateRoot = path.join(homeDir, 'state');
+  const timeout = Object.assign(new Error('spawnSync codex ETIMEDOUT'), { code: 'ETIMEDOUT' });
+  const commandRunner = (command, args, runOptions) => {
+    assert.equal(command, 'codex');
+    assert.deepEqual(args, ['app-server', '--stdio']);
+    assert.equal(runOptions.timeout, 5000);
+    const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
+    return {
+      error: timeout,
+      status: null,
+      stdout: [
+        JSON.stringify({ jsonrpc: '2.0', method: 'window/logMessage', params: { message: 'still alive' } }),
+        JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2024-11-05' } }),
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 2,
+          result: {
+            data: [{
+              hooks: managed.map((hook) => ({
+                key: codexAppServerKey(configPath, hook),
+                command: hook.command,
+                currentHash: `timeout-hash-${hook.event}`
+              }))
+            }]
+          }
+        })
+      ].join('\n') + '\n'
+    };
+  };
+
+  const result = installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
+  const trust = parseCodexTrustedHookState(fs.readFileSync(configPath, 'utf8'));
+
+  assert.equal(result.ok, true);
+  assert.equal(result.trustConfigured, true);
+  assert.equal(result.trustWarning, 'codex_app_server_timed_out_after_response');
+  assert.equal(result.trustTerminatedAfterResponse, true);
+  assert.equal(result.trustTerminationCode, 'ETIMEDOUT');
+  assert.equal(trust.size, CODEX_HOOK_EVENTS.length);
+  assert.equal([...trust.values()].every((hash) => hash.startsWith('timeout-hash-')), true);
+});
+
+test('Codex trust discovery rejects app-server timeout without complete hooks/list response', () => {
+  const homeDir = tempRoot();
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+  const writerPath = path.join(homeDir, 'agent-event.js');
+  const stateRoot = path.join(homeDir, 'state');
+  const timeout = Object.assign(new Error('spawnSync codex ETIMEDOUT'), { code: 'ETIMEDOUT' });
+  const commandRunner = () => ({
+    error: timeout,
+    status: null,
+    stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2024-11-05' } })}\n`
+  });
+
+  const result = installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
+  const installed = fs.readFileSync(configPath, 'utf8');
+
+  assert.equal(result.ok, true);
+  assert.equal(result.trustConfigured, false);
+  assert.equal(result.trustCode, 'codex_app_server_unavailable');
+  assert.deepEqual(parseCodexManagedTrustEntries(installed), []);
+  assert.deepEqual([...parseCodexTrustedHookState(installed).keys()], []);
+});
+
+test('Codex reinstall fallback removes prior managed exact trust and leaves no orphan for uninstall', () => {
+  const homeDir = tempRoot();
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+  const writerPath = path.join(homeDir, 'agent-event.js');
+  const stateRoot = path.join(homeDir, 'state');
+  const sidepulseKey = 'sidepulse.SessionStart.0.0';
+  const sidepulseSimilarKey = 'sidepulse.SessionStart.0.00';
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, [
+    'model = "gpt-5"',
+    '',
+    '[hooks.state."sidepulse.SessionStart.0.0"]',
+    'trusted_hash = "sidepulse-hash"',
+    '',
+    '[hooks.state."sidepulse.SessionStart.0.00"]',
+    'trusted_hash = "sidepulse-similar-hash"',
+    ''
+  ].join('\n'));
+
+  let failDiscovery = false;
+  const timeout = Object.assign(new Error('spawnSync codex ETIMEDOUT'), { code: 'ETIMEDOUT' });
+  const commandRunner = () => {
+    if (failDiscovery) {
+      return {
+        error: timeout,
+        status: null,
+        stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2024-11-05' } })}\n`
+      };
+    }
+    const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
+    return {
+      status: 0,
+      stdout: `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        result: {
+          hooks: managed.map((hook) => ({
+            key: `${configPath}:managed:${hook.event}:${hook.outerIndex}:${hook.hookIndex}`,
+            command: hook.command,
+            currentHash: `hash-${hook.event}`
+          }))
+        }
+      })}\n`
+    };
+  };
+
+  const trustedInstall = installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
+  assert.equal(trustedInstall.trustConfigured, true);
+  const previouslyManagedKeys = trustedInstall.trustedKeys;
+  assert.equal(previouslyManagedKeys.length, CODEX_HOOK_EVENTS.length);
+
+  failDiscovery = true;
+  const fallbackInstall = installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
+  const fallback = fs.readFileSync(configPath, 'utf8');
+  const fallbackTrust = parseCodexTrustedHookState(fallback);
+
+  assert.equal(fallbackInstall.ok, true);
+  assert.equal(fallbackInstall.trustConfigured, false);
+  assert.equal(fallbackInstall.trustCode, 'codex_app_server_unavailable');
+  assert.deepEqual(parseCodexManagedTrustEntries(fallback), []);
+  for (const key of previouslyManagedKeys) assert.equal(fallbackTrust.has(key), false);
+  assert.equal(fallbackTrust.get(sidepulseKey), 'sidepulse-hash');
+  assert.equal(fallbackTrust.get(sidepulseSimilarKey), 'sidepulse-similar-hash');
+
+  const uninstalledResult = uninstallCodexLifecycle({ homeDir, codexConfigPath: configPath });
+  const uninstalled = fs.readFileSync(configPath, 'utf8');
+  const uninstalledTrust = parseCodexTrustedHookState(uninstalled);
+
+  assert.equal(uninstalledResult.changed, true);
+  assert.doesNotMatch(uninstalled, /token-monitor-agent-lifecycle/);
+  assert.deepEqual(parseCodexManagedTrustEntries(uninstalled), []);
+  for (const key of previouslyManagedKeys) assert.equal(uninstalledTrust.has(key), false);
+  assert.equal(uninstalledTrust.get(sidepulseKey), 'sidepulse-hash');
+  assert.equal(uninstalledTrust.get(sidepulseSimilarKey), 'sidepulse-similar-hash');
+});
+
+test('Codex trust discovery rejects conflicting duplicate app-server hook entries', () => {
+  const homeDir = tempRoot();
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+  const writerPath = path.join(homeDir, 'agent-event.js');
+  const stateRoot = path.join(homeDir, 'state');
+  const commandRunner = () => {
+    const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
+    const hooks = managed.map((hook) => ({ key: codexAppServerKey(configPath, hook), command: hook.command, currentHash: `hash-${hook.event}` }));
+    const conflict = { ...hooks[0], currentHash: 'different-hash' };
+    return {
+      status: 0,
+      stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { data: [{ cwd: homeDir, hooks }, { cwd: process.cwd(), hooks: [conflict] }] } })}\n`
+    };
+  };
+
+  const result = installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.trustConfigured, false);
+  assert.equal(result.trustCode, 'trust_discovery_conflict');
+  const config = fs.readFileSync(configPath, 'utf8');
+  assert.deepEqual(parseCodexManagedTrustEntries(config), []);
+  assert.deepEqual([...parseCodexTrustedHookState(config).keys()], []);
+});
+
+test('Codex reinstall atomically refreshes exact managed trust keys', () => {
+  const homeDir = tempRoot();
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+  const writerPath = path.join(homeDir, 'agent-event.js');
+  const stateRoot = path.join(homeDir, 'state');
+  let generation = 1;
+  const commandRunner = () => {
+    const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
+    return {
+      status: 0,
+      stdout: `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        result: {
+          data: [{
+            hooks: managed.map((hook) => ({
+              key: `${configPath}:gen-${generation}:hooks.${hook.event}[${hook.outerIndex}].hooks[${hook.hookIndex}]`,
+              command: hook.command,
+              currentHash: `hash-${generation}-${hook.event}`
+            }))
+          }]
+        }
+      })}\n`
+    };
+  };
+
+  assert.equal(installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner }).trustConfigured, true);
+  const first = fs.readFileSync(configPath, 'utf8');
+  assert.match(first, /gen-1/);
+  generation = 2;
+  assert.equal(installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner }).trustConfigured, true);
+  const second = fs.readFileSync(configPath, 'utf8');
+
+  assert.doesNotMatch(second, /gen-1/);
+  assert.match(second, /gen-2/);
+  assert.equal(parseCodexManagedTrustEntries(second).length, CODEX_HOOK_EVENTS.length);
+  assert.equal([...parseCodexTrustedHookState(second).keys()].every((key) => key.includes('gen-2')), true);
+});
+
+test('Codex analyzer treats missing or wrong nested hook async as partial, not exact', () => {
+  const homeDir = tempRoot();
+  const writerPath = path.join(homeDir, 'agent-event.js');
+  const stateRoot = path.join(homeDir, 'state');
+  const commandRunner = () => ({ status: 0, stdout: `${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { hooks: [] } })}\n` });
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+
+  installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
+  const installed = fs.readFileSync(configPath, 'utf8');
+  const missingAsync = installed.replace(/\nasync = false\n/, '\n');
+  const wrongAsync = installed.replace(/\nasync = false\n/, '\nasync = true\n');
+
+  for (const config of [missingAsync, wrongAsync]) {
+    const analyzed = analyzeCodexHooks(config, { writerPath, stateRoot });
+    assert.equal(analyzed.complete, false);
+    assert.deepEqual(analyzed.partialEvents, ['SessionStart']);
+    assert.deepEqual(analyzed.configuredEvents, CODEX_HOOK_EVENTS.filter((event) => event !== 'SessionStart'));
+  }
+
+  fs.writeFileSync(configPath, wrongAsync);
+  const doctor = doctorAgentLifecycle({ harnesses: ['codex'], homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath });
+  assert.equal(doctor.results[0].capability, 'presence_only');
+  assert.equal(doctor.results[0].hooksConfigured, false);
+  assert.deepEqual(doctor.results[0].partialEvents, ['SessionStart']);
+});
+
+test('Codex install reports unconfigured trust when app-server omits current Token Monitor hashes', () => {
+  const homeDir = tempRoot();
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+  const writerPath = path.join(homeDir, 'agent-event.js');
+  const stateRoot = path.join(homeDir, 'state');
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, 'model = "gpt-5"\n');
+
+  const result = installCodexLifecycle({
+    homeDir,
+    codexConfigPath: configPath,
+    codexVersion: '0.150.1',
+    stateRoot,
+    writerPath,
+    commandRunner: () => ({
+      status: 0,
+      stdout: `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        result: {
+          providers: [
+            { name: 'sidepulse', hooks: [{ key: 'sidepulse.SessionStart.0.0', command: 'sidepulse', currentHash: 'sidepulse-hash' }] },
+            { name: 'token-monitor', hooks: [{ key: 'wrong.0.0', command: 'not-token-monitor', currentHash: 'wrong-hash' }] }
+          ]
+        }
+      })}\n`
+    })
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.trustConfigured, false);
+  assert.equal(result.trustCode, 'trust_discovery_incomplete');
+  const installed = fs.readFileSync(configPath, 'utf8');
+  assert.match(installed, /token-monitor-agent-lifecycle/);
+  assert.doesNotMatch(installed, /wrong-hash|sidepulse-hash/);
+  const doctor = doctorAgentLifecycle({ harnesses: ['codex'], homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath });
+  assert.equal(doctor.ok, false);
+  assert.equal(doctor.results[0].capability, 'presence_only');
+  assert.deepEqual(doctor.results[0].untrustedEvents, CODEX_HOOK_EVENTS);
+  assert.match(doctor.results[0].trustRepairAction, /install command again/);
+});
+
+test('Codex trust state parser decodes quoted table keys exactly and rejects malformed escapes', () => {
+  const windowsKey = 'C:\\Users\\me\\.codex\\config.toml:session_start:1:0';
+  const quotedBracketKey = 'quoted "key" [section]:SessionStart:1:0';
+  const unicodeKey = 'unicode東京:PostToolUse:1:0';
+  const config = [
+    `[hooks.state.${JSON.stringify(windowsKey)}]`,
+    'trusted_hash = "windows-hash"',
+    '',
+    `[hooks.state.${JSON.stringify(quotedBracketKey)}]`,
+    'trusted_hash = "quoted-hash"',
+    '',
+    '[hooks.state."unicode\\u6771\\u4eac:PostToolUse:1:0"]',
+    'trusted_hash = "unicode-hash"',
+    '',
+    '[hooks.state."bad\\qescape"]',
+    'trusted_hash = "bad-hash"',
+    '',
+    '[hooks.state."unterminated\\"]',
+    'trusted_hash = "unterminated-hash"',
+    ''
+  ].join('\n');
+
+  const trust = parseCodexTrustedHookState(config);
+
+  assert.equal(trust.get(windowsKey), 'windows-hash');
+  assert.equal(trust.get(quotedBracketKey), 'quoted-hash');
+  assert.equal(trust.get(unicodeKey), 'unicode-hash');
+  assert.equal(trust.has('bad\\qescape'), false);
+  assert.equal(trust.has('unterminated\\'), false);
+  assert.deepEqual([...trust.keys()], [windowsKey, quotedBracketKey, unicodeKey]);
+});
+
+test('Codex install and doctor round-trip escaped exact app-server trust keys', () => {
+  const homeDir = tempRoot();
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+  const writerPath = path.join(homeDir, 'agent event.js');
+  const stateRoot = path.join(homeDir, 'state with spaces');
+  const commandRunner = () => {
+    const managed = parseCodexManagedHooks(fs.readFileSync(configPath, 'utf8'));
+    return {
+      status: 0,
+      stdout: `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        result: {
+          hooks: managed.map((hook) => ({
+            key: codexEscapedAppServerKey(hook),
+            command: hook.command,
+            currentHash: `hash-${hook.event}`
+          }))
+        }
+      })}\n`
+    };
+  };
+
+  const result = installCodexLifecycle({ homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath, commandRunner });
+  const installed = fs.readFileSync(configPath, 'utf8');
+  const trust = parseCodexTrustedHookState(installed);
+  const sessionStart = CODEX_HOOK_EVENTS.includes('SessionStart')
+    ? parseCodexManagedHooks(installed).find((hook) => hook.event === 'SessionStart')
+    : null;
+  const exactSessionStartKey = codexEscapedAppServerKey(sessionStart);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.trustConfigured, true);
+  assert.ok(installed.includes('[hooks.state."C:\\\\Users\\\\me\\\\.codex\\\\config.toml:session_start:1:0"]'));
+  assert.equal(trust.get(exactSessionStartKey), 'hash-SessionStart');
+  assert.equal(trust.size, CODEX_HOOK_EVENTS.length);
+
+  const doctor = doctorAgentLifecycle({ harnesses: ['codex'], homeDir, codexConfigPath: configPath, codexVersion: '0.150.1', stateRoot, writerPath });
+  assert.equal(doctor.ok, true);
+  assert.equal(doctor.results[0].capability, 'exact');
+  assert.deepEqual(doctor.results[0].untrustedEvents, []);
+  assert.ok(doctor.results[0].trustedEvents.includes('SessionStart'));
+});
+
+test('Codex uninstall removes only owned escaped exact trust key and preserves unrelated state', () => {
+  const homeDir = tempRoot();
+  const configPath = path.join(homeDir, '.codex', 'config.toml');
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  const ownedKey = 'C:\\Users\\me\\.codex\\config.toml:session_start:1:0';
+  const unrelatedSimilarKey = 'C:\\Users\\me\\.codex\\config.toml:session_start:1:00';
+  const unrelatedQuotedKey = 'quoted "key" [section]:session_start:1:0';
+  fs.writeFileSync(configPath, [
+    'model = "gpt-5"',
+    '',
+    `# >>> token-monitor-agent-lifecycle:v1`,
+    '# owner = Token Monitor agent lifecycle',
+    `# tokenMonitorTrustEntry = ${JSON.stringify({ event: 'SessionStart', command: 'token-monitor', key: ownedKey })}`,
+    '[[hooks.SessionStart]]',
+    'matcher = "*"',
+    `# <<< token-monitor-agent-lifecycle:v1`,
+    '',
+    `[hooks.state.${JSON.stringify(ownedKey)}]`,
+    'trusted_hash = "owned-hash"',
+    '',
+    `[hooks.state.${JSON.stringify(unrelatedSimilarKey)}]`,
+    'trusted_hash = "similar-hash"',
+    '',
+    `[hooks.state.${JSON.stringify(unrelatedQuotedKey)}]`,
+    'trusted_hash = "quoted-hash"',
+    ''
+  ].join('\n'));
+
+  const result = uninstallCodexLifecycle({ homeDir, codexConfigPath: configPath });
+  const uninstalled = fs.readFileSync(configPath, 'utf8');
+  const trust = parseCodexTrustedHookState(uninstalled);
+
+  assert.equal(result.changed, true);
+  assert.doesNotMatch(uninstalled, /token-monitor-agent-lifecycle/);
+  assert.equal(trust.has(ownedKey), false);
+  assert.equal(trust.get(unrelatedSimilarKey), 'similar-hash');
+  assert.equal(trust.get(unrelatedQuotedKey), 'quoted-hash');
 });
 
 test('Codex install validates config before creating writer or backups', () => {
