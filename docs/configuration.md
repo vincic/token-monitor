@@ -63,6 +63,8 @@ Provider credentials (Grok, DeepSeek, Minimax, Copilot, GLM / GLM Team, Volcengi
 
 The widget reads most settings as first-run defaults. WorkBuddy follows the same provider checkbox as other auto-detected integrations on macOS and Windows; Linux local-app monitoring is unsupported. Desktop users do not copy a token, and the WorkBuddy token fields above apply only to the headless agent/CLI. The agent and hub take a CLI flag over an env var over the built-in default.
 
+On macOS, the widget can optionally forward authenticated agent lifecycle transitions to SidePulse. It is off by default; enable `SidePulse output` in Settings or seed first-run defaults with `TOKEN_MONITOR_SIDEPULSE_ENABLED=1` and `TOKEN_MONITOR_SIDEPULSE_SOCKET`. The sink writes only SidePulse socket events, not LED files, and should be canaried before removing any direct SidePulse hooks.
+
 One-shot run (collect once and exit — useful for cron / launchd):
 
 ```bash

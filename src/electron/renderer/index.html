@@ -1599,6 +1599,15 @@
               <p class="settings-note hub-warning" data-i18n="settings.sync.hostWarning">The hub runs while Token Monitor is running. Quitting (not just closing the window) stops the hub for all connected devices.</p>
             </div>
             <label><span data-i18n="settings.sync.deviceId">Device ID</span><input id="deviceIdInput" type="text" spellcheck="false" placeholder="auto (hostname)" data-i18n-placeholder="settings.sync.deviceIdPlaceholder" /></label>
+            <label class="settings-item sidepulse-toggle-row">
+              <span class="settings-item-text">
+                <span class="settings-item-title" data-i18n="settings.sidepulse.title">SidePulse output</span>
+                <span class="settings-item-description" data-i18n="settings.sidepulse.desc">Forward agent lifecycle changes to the local SidePulse socket.</span>
+              </span>
+              <input id="sidepulseEnabledInput" type="checkbox" />
+            </label>
+            <label id="sidepulseSocketRow" class="sidepulse-socket-row hidden"><span data-i18n="settings.sidepulse.socket">Socket path</span><input id="sidepulseSocketInput" type="text" spellcheck="false" /></label>
+            <div id="sidepulseStatus" class="hub-status" hidden></div>
             <div class="settings-actions">
               <button id="saveSettingsButton" data-i18n="settings.common.save">Save</button>
             </div>

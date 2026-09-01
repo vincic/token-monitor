@@ -80,7 +80,7 @@ test('publishes projected stats to the macOS Widget on collection and presentati
   const end = mainSource.indexOf('\nfunction statsHistoryRevision', start);
   assert.ok(start >= 0 && end > start, 'sendPush function should exist');
   const sendPush = mainSource.slice(start, end);
-  assert.match(sendPush, /latestStats = payload\.data\.stats;\s+const visibleStats = electronPresentationStats\(latestStats\);/);
+  assert.match(sendPush, /latestStats = payload\.data\.stats;\s+(?:if \(!options\.skipSidePulse\) ingestSidePulseStats\(latestStats\);\s+)?const visibleStats = electronPresentationStats\(latestStats\);/);
   assert.match(sendPush, /scheduleMacWidgetSnapshot\(visibleStats, options\.widgetProducerOwner\);/);
   assert.equal((mainSource.match(/scheduleMacWidgetSnapshot\(visibleStats, options\.widgetProducerOwner\)/g) || []).length, 1);
   const refreshStart = mainSource.indexOf('function refreshLimitStatsPresentation()');
@@ -106,7 +106,7 @@ test('Widget producers carry lifetime ownership through the sendPush outlet', ()
     assert.ok(start >= 0, `${signature} should exist`);
     const source = mainSource.slice(start, end === -1 ? mainSource.length : end);
     assert.match(source, /const widgetProducerOwner = captureMacWidgetProducerOwner\(\);/);
-    assert.match(source, /sendPush\([\s\S]*\{ widgetProducerOwner \}\)/);
+    assert.match(source, /sendPush\([\s\S]*\{[^}]*widgetProducerOwner[^}]*\}\)/);
   }
 });
 

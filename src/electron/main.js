@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const crypto = require('node:crypto');
+const nodeNet = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, nativeImage, nativeTheme, net, Notification, screen, session, shell } = require('electron');
@@ -276,6 +277,11 @@ const { createCodexResetForecastClient } = require('./codexResetForecast');
 const { createUpdateInstallQuitGuard, observeUpdateInstallHandoff } = require('./updateInstallQuit');
 const { classifyStreamFailure } = require('./syncConnection');
 const {
+  DEFAULT_SOCKET_PATH: SIDEPULSE_DEFAULT_SOCKET_PATH,
+  createSidePulseSink,
+  normalizeSidePulseSocketPath
+} = require('./sidepulseSink');
+const {
   attachLocalNativeViews,
   attachLocalPresentationNativeViews,
   composeLocalSyncStats
@@ -516,6 +522,8 @@ function defaultSettings() {
     collectionMode: 'live',
     collectionIntervalMs: 5 * 60 * 1000,
     syncUploadIntervalMs: normalizeSyncUploadIntervalMs(process.env.TOKEN_MONITOR_SYNC_UPLOAD_INTERVAL_MS),
+    sidepulseEnabled: parseBoolean(process.env.TOKEN_MONITOR_SIDEPULSE_ENABLED, false),
+    sidepulseSocketPath: normalizeSidePulseSocketPath(process.env.TOKEN_MONITOR_SIDEPULSE_SOCKET),
     serviceProviderDisplayOrder: '',
     hiddenServiceProviders: '',
     serviceStatusRefreshMs: 60000,
@@ -2402,6 +2410,8 @@ function readSettings() {
     merged.collectionMode = normalizeCollectionMode(merged.collectionMode);
     merged.collectionIntervalMs = normalizeCollectionIntervalMs(merged.collectionIntervalMs);
     merged.syncUploadIntervalMs = normalizeSyncUploadIntervalMs(merged.syncUploadIntervalMs);
+    merged.sidepulseEnabled = parseBoolean(merged.sidepulseEnabled, false);
+    merged.sidepulseSocketPath = normalizeSidePulseSocketPath(merged.sidepulseSocketPath);
     merged.heatmapMetric = normalizeHeatmapMetric(merged.heatmapMetric);
     merged.homeActiveDaysWindow = normalizeHomeActiveDaysWindow(merged.homeActiveDaysWindow);
     merged.reduceMotion = motionPreferenceApi.normalize(merged.reduceMotion);
@@ -2771,6 +2781,7 @@ let latestHubStatsIdentity = null;
 let hubModeGeneration = 0;
 let tray = null;
 let latestStats = null;
+let sidePulseSink = null;
 let macWidgetSnapshotController = null;
 let macWidgetDemand = null;
 let macWidgetPublicationReady = false;
@@ -2778,6 +2789,36 @@ let cachedMacWidgetConfiguration;
 let trayRefreshInFlight = false;
 let trayCodexActiveAccountId = '';
 let trayCodexPendingAccountId = '';
+
+function sidePulseSinkEnabled() {
+  return process.platform === 'darwin' && settings?.sidepulseEnabled === true;
+}
+
+function sidePulseSinkConfig() {
+  return {
+    enabled: sidePulseSinkEnabled(),
+    socketPath: settings?.sidepulseSocketPath || SIDEPULSE_DEFAULT_SOCKET_PATH,
+    connectTimeoutMs: 200
+  };
+}
+
+function ensureSidePulseSink() {
+  if (!sidePulseSink) {
+    sidePulseSink = createSidePulseSink({
+      ...sidePulseSinkConfig(),
+      logger: console,
+      net: nodeNet
+    });
+    return sidePulseSink;
+  }
+  sidePulseSink.reconfigure(sidePulseSinkConfig());
+  return sidePulseSink;
+}
+
+function ingestSidePulseStats(stats) {
+  if (!sidePulseSinkEnabled()) return;
+  ensureSidePulseSink().ingestStats(stats);
+}
 
 function electronPresentationStats(stats) {
   return projectLimitStatsForDisplay(stats, {
@@ -3688,7 +3729,7 @@ function startSyncCollector() {
       const displayStats = composeLocalSyncStats(latestHubStats, lastCollectedDevice);
       if (displayStats) {
         updateDiscordRpcDisplay(displayStats);
-        sendPush({ event: 'stats', data: { type: 'stats', reason: 'local', stats: displayStats, at: new Date().toISOString() } }, { widgetProducerOwner });
+        sendPush({ event: 'stats', data: { type: 'stats', reason: 'local', stats: displayStats, at: new Date().toISOString() } }, { widgetProducerOwner, skipSidePulse: true });
       }
       await syncUploadScheduler.enqueue(visibleSummary, revision);
     },
@@ -4050,6 +4091,7 @@ function sendPush(payload, options = {}) {
   if (payload?.data?.stats) {
     injectLocalDeviceStatus(payload.data.stats);
     latestStats = payload.data.stats;
+    if (!options.skipSidePulse) ingestSidePulseStats(latestStats);
     const visibleStats = electronPresentationStats(latestStats);
     rendererPayload = {
       ...payload,
@@ -4367,11 +4409,12 @@ async function startStatsStream(options = {}) {
         if (parsed) {
           if (parsed.event === 'stats' && parsed.data?.stats) {
             setLatestHubStatsCache(parsed.data.stats, 'client', generation, cacheIdentity);
+            ingestSidePulseStats(parsed.data.stats);
             const displayStats = composeLocalSyncStats(latestHubStats, lastCollectedDevice);
             parsed = { ...parsed, data: { ...parsed.data, stats: displayStats } };
             updateDiscordRpcDisplay(displayStats);
           }
-          sendPush(parsed, { widgetProducerOwner });
+          sendPush(parsed, { widgetProducerOwner, skipSidePulse: parsed.event === 'stats' });
         }
       }
     }
@@ -4763,6 +4806,10 @@ function settingsForRenderer() {
     kimiCredentialSource: kimiWebAccessTokenSource || kimiApiKeySource,
     currencyRatesEffective: effectiveRates || resolveEffectiveRates(rateCache?.rates || {}, settings?.currencyRates || {}),
     currencyRateInfo: rateCache ? { source: rateCache.source, date: rateCache.date, fetchedAt: rateCache.fetchedAt } : null,
+    sidepulseStatus: {
+      available: process.platform === 'darwin',
+      ...(sidePulseSink ? sidePulseSink.status() : sidePulseSinkConfig())
+    },
     windowToggleShortcutStatus: currentWindowToggleShortcutStatus()
   };
 }
@@ -5286,6 +5333,8 @@ function stopAll() {
   stopStatsStream();
   stopHostStats();
   stopSyncCollector({ skipCloseWatchers: true });
+  sidePulseSink?.stop();
+  sidePulseSink = null;
   macWidgetSnapshotController?.stop();
   if (macWidgetDemand) {
     macWidgetDemand.stop();
@@ -6485,6 +6534,8 @@ app.whenReady().then(() => {
     const previousStartAtLogin = settings.startAtLogin;
     const previousAutomaticAppUpdates = settings.automaticAppUpdates;
     const previousCustomModelPricing = JSON.stringify(settings.customModelPricing || []);
+    const previousSidePulseEnabled = settings.sidepulseEnabled === true;
+    const previousSidePulseSocketPath = String(settings.sidepulseSocketPath || SIDEPULSE_DEFAULT_SOCKET_PATH);
     const normalizedCurrency = patch.currency !== undefined ? normalizeCurrency(patch.currency, settings.currency) : normalizeCurrency(settings.currency);
     const normalizedPatch = { ...patch, currency: normalizedCurrency };
     delete normalizedPatch.windowMaximized;
@@ -6614,6 +6665,8 @@ app.whenReady().then(() => {
       collectionMode: normalizeCollectionMode(patch.collectionMode ?? settings.collectionMode),
       collectionIntervalMs: normalizeCollectionIntervalMs(patch.collectionIntervalMs ?? settings.collectionIntervalMs),
       syncUploadIntervalMs: normalizeSyncUploadIntervalMs(patch.syncUploadIntervalMs ?? settings.syncUploadIntervalMs),
+      sidepulseEnabled: parseBoolean(patch.sidepulseEnabled ?? settings.sidepulseEnabled, false),
+      sidepulseSocketPath: normalizeSidePulseSocketPath(patch.sidepulseSocketPath ?? settings.sidepulseSocketPath),
       serviceProviderDisplayOrder: patch.serviceProviderDisplayOrder !== undefined ? String(patch.serviceProviderDisplayOrder || '') : (settings.serviceProviderDisplayOrder || ''),
       hiddenServiceProviders: patch.hiddenServiceProviders !== undefined ? String(patch.hiddenServiceProviders || '') : (settings.hiddenServiceProviders || ''),
       serviceStatusRefreshMs: normalizeServiceStatusRefreshMs(patch.serviceStatusRefreshMs ?? settings.serviceStatusRefreshMs),
@@ -6684,6 +6737,11 @@ app.whenReady().then(() => {
     if (JSON.stringify(settings.customModelPricing || []) !== previousCustomModelPricing) {
       regenerateTokscalePricing();
       refreshAfterPricingChange();
+    }
+    if (settings.sidepulseEnabled !== previousSidePulseEnabled
+      || String(settings.sidepulseSocketPath || SIDEPULSE_DEFAULT_SOCKET_PATH) !== previousSidePulseSocketPath) {
+      ensureSidePulseSink();
+      if (settings.sidepulseEnabled && latestStats) ingestSidePulseStats(latestStats);
     }
     configureWindowToggleShortcut();
     if (settings.startAtLogin !== previousStartAtLogin) {

@@ -1,6 +1,6 @@
 # Agent lifecycle adapters
 
-Token Monitor can collect short-lived lifecycle state from local agent harnesses and merge it with the existing device record. Phase 2 installs local adapters only. It does not deploy a SidePulse sink, remove existing SidePulse hooks, or change hub deployment.
+Token Monitor can collect short-lived lifecycle state from local agent harnesses and merge it with the existing device record.
 
 ## Privacy and schema
 
@@ -11,6 +11,17 @@ schemaVersion, harness, profile, sessionId, event, toolName, surface, adapterVer
 ```
 
 The adapters must not write prompts, messages, transcript paths, working directories, tool arguments, tool results, approval details, emails, credentials, `mode`, or `deviceId`. The runtime normalizes and hash-scopes raw `sessionId` values on read. On the wire, `sessionId` is only a `sha256:` opaque value scoped by harness and profile.
+
+The optional macOS SidePulse output consumes only authenticated aggregate `stats.agentActivity.states`. It never reads usage sessions and never forwards prompts, messages, project names, paths, tool arguments, tool results, provider account ids, emails, or credentials. The SidePulse `session_id` is a deterministic Token Monitor hash over device, harness, profile, and the already-opaque lifecycle session id, so sessions remain distinct across devices and profiles without exposing the raw provider identity.
+
+Enable it from the widget settings or with:
+
+```bash
+TOKEN_MONITOR_SIDEPULSE_ENABLED=1
+TOKEN_MONITOR_SIDEPULSE_SOCKET=~/.local/state/sidepulse/agent-monitor/events.sock
+```
+
+It sends one JSON message to the SidePulse Unix socket and closes the connection. Token Monitor never writes LED files directly. Run it as a canary alongside existing direct SidePulse hooks first; after SidePulse shows the same transitions from Token Monitor, uninstall the direct hooks to avoid duplicate events. Rollback is disabling `SidePulse output` or setting `TOKEN_MONITOR_SIDEPULSE_ENABLED=0`, then restoring direct hooks if you removed them.
 
 State files are written under the existing safe state root with a 0700 directory, 0600 temporary files, atomic rename, and 64-hex hashed filenames. Hook subprocesses fail open, produce no stdout, cap native input at 1 MiB, and reject malformed JSON or missing identity.
 
