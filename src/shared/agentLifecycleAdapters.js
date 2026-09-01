@@ -304,10 +304,79 @@ function defaultWriterPath(options = {}) {
   return path.join(env.XDG_DATA_HOME || path.join(homeDir, '.local', 'share'), 'token-monitor', 'agent-lifecycle', 'agent-event.js');
 }
 
-function safeReadRegularFile(filePath) {
+const DARWIN_SYSTEM_ALIASES = new Map([
+  ['/etc', '/private/etc'],
+  ['/tmp', '/private/tmp'],
+  ['/var', '/private/var']
+]);
+
+function fsRealpath(targetPath) {
+  return fs.realpathSync.native(targetPath);
+}
+
+function darwinSystemAliasTarget(candidate, target) {
+  if (process.platform !== 'darwin') return '';
+  const expected = DARWIN_SYSTEM_ALIASES.get(candidate);
+  if (!expected || candidate === target) return '';
   let stat;
   try {
-    stat = fs.lstatSync(filePath);
+    stat = fs.lstatSync(candidate);
+  } catch (_) {
+    return '';
+  }
+  if (!stat.isSymbolicLink() || stat.uid !== 0) return '';
+  try {
+    return fsRealpath(candidate) === expected ? expected : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function canonicalPathForDarwinSystemAliases(targetPath) {
+  let resolved = path.resolve(targetPath);
+  if (process.platform !== 'darwin') return resolved;
+  const root = path.parse(resolved).root;
+  const parts = resolved.slice(root.length).split(path.sep).filter(Boolean);
+  let current = root;
+  for (const part of parts) {
+    current = path.join(current, part);
+    const replacement = darwinSystemAliasTarget(current, resolved);
+    if (!replacement) continue;
+    resolved = path.join(replacement, path.relative(current, resolved));
+    break;
+  }
+  return resolved;
+}
+
+function safeExistingParentTraversal(filePath) {
+  const resolvedPath = canonicalPathForDarwinSystemAliases(filePath);
+  const parent = path.resolve(path.dirname(resolvedPath));
+  const root = path.parse(parent).root;
+  const parts = parent.slice(root.length).split(path.sep).filter(Boolean);
+  let current = root || path.sep;
+  for (const part of parts) {
+    current = path.join(current, part);
+    let stat;
+    try {
+      stat = fs.lstatSync(current);
+    } catch (error) {
+      if (error.code === 'ENOENT') break;
+      return { ok: false, code: 'unsafe_destination', path: current, message: error.message };
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      return { ok: false, code: 'unsafe_destination', path: current };
+    }
+  }
+  return { ok: true, path: resolvedPath };
+}
+
+function safeReadRegularFile(filePath) {
+  const traversal = safeExistingParentTraversal(filePath);
+  if (!traversal.ok) return { ok: false, exists: true, code: traversal.code, path: traversal.path, message: traversal.message };
+  const resolvedPath = traversal.path;
+  let stat;
+  try {
+    stat = fs.lstatSync(resolvedPath);
   } catch (error) {
     if (error.code === 'ENOENT') return { ok: true, exists: false, content: '' };
     return { ok: false, exists: true, code: 'unsafe_destination', path: filePath, message: error.message };
@@ -316,14 +385,15 @@ function safeReadRegularFile(filePath) {
     return { ok: false, exists: true, code: 'unsafe_destination', path: filePath };
   }
   try {
-    return { ok: true, exists: true, content: fs.readFileSync(filePath, 'utf8') };
+    return { ok: true, exists: true, content: fs.readFileSync(resolvedPath, 'utf8'), path: resolvedPath };
   } catch (error) {
     return { ok: false, exists: true, code: 'unsafe_destination', path: filePath, message: error.message };
   }
 }
 
 function safeWritableParentDirectory(filePath) {
-  const parent = path.resolve(path.dirname(filePath));
+  const destination = canonicalPathForDarwinSystemAliases(filePath);
+  const parent = path.resolve(path.dirname(destination));
   const root = path.parse(parent).root;
   const parts = parent.slice(root.length).split(path.sep).filter(Boolean);
   let current = root || path.sep;
@@ -348,7 +418,7 @@ function safeWritableParentDirectory(filePath) {
         return { ok: false, code: 'unsafe_destination', path: existing };
       }
       fs.accessSync(existing, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
-      return { ok: true };
+      return { ok: true, destination, parent };
     } catch (error) {
       if (error.code !== 'ENOENT') {
         return { ok: false, code: 'unsafe_destination', path: existing, message: error.message };
@@ -366,12 +436,15 @@ function safeFilePresent(filePath) {
 }
 
 function copyTemplate(templateRelativePath, destination, options = {}) {
+  const parent = safeWritableParentDirectory(destination);
+  if (!parent.ok) return { ok: false, changed: false, collision: true, code: parent.code, source: path.join(repoRoot(), templateRelativePath), destination, path: parent.path };
+  const writeDestination = parent.destination;
   const source = path.join(repoRoot(), templateRelativePath);
   const sourceContent = fs.readFileSync(source, 'utf8');
   const content = typeof options.renderTemplate === 'function'
     ? options.renderTemplate(sourceContent)
     : sourceContent;
-  const file = safeReadRegularFile(destination);
+  const file = safeReadRegularFile(writeDestination);
   if (!file.ok) return { ok: false, changed: false, collision: true, code: file.code, source, destination, path: destination };
   const hasExisting = file.exists;
   const existing = file.content;
@@ -380,11 +453,11 @@ function copyTemplate(templateRelativePath, destination, options = {}) {
     return { ok: false, changed: false, collision: true, code: 'unmanaged_collision', source, destination };
   }
   if (options.dryRun) return { ok: true, changed: existing !== content, source, destination };
-  fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.dirname(writeDestination), { recursive: true, mode: 0o700 });
   if (existing === content) return { ok: true, changed: false, source, destination };
-  const backup = hasExisting && managedTemplate ? backupExisting(destination, options) : '';
-  fs.writeFileSync(destination, content, { encoding: 'utf8', mode: 0o600 });
-  if (process.platform !== 'win32') fs.chmodSync(destination, 0o600);
+  const backup = hasExisting && managedTemplate ? backupExisting(writeDestination, options) : '';
+  fs.writeFileSync(writeDestination, content, { encoding: 'utf8', mode: 0o600 });
+  if (process.platform !== 'win32') fs.chmodSync(writeDestination, 0o600);
   return { ok: true, changed: true, source, destination, backup };
 }
 
@@ -432,12 +505,15 @@ function fileContentChanged(filePath, content) {
 }
 
 function writeManagedFile(filePath, content, options = {}) {
-  const file = safeReadRegularFile(filePath);
+  const parent = safeWritableParentDirectory(filePath);
+  if (!parent.ok) return { ok: false, code: parent.code, path: parent.path, message: parent.message };
+  const writePath = parent.destination;
+  const file = safeReadRegularFile(writePath);
   if (!file.ok) return { ok: false, code: file.code, path: filePath };
   if (options.dryRun) return { ok: true, changed: !file.exists || file.content !== content };
-  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(filePath, content, { encoding: 'utf8', mode: 0o600 });
-  if (process.platform !== 'win32') fs.chmodSync(filePath, 0o600);
+  fs.mkdirSync(path.dirname(writePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(writePath, content, { encoding: 'utf8', mode: 0o600 });
+  if (process.platform !== 'win32') fs.chmodSync(writePath, 0o600);
   return { ok: true, changed: !file.exists || file.content !== content };
 }
 
@@ -546,13 +622,16 @@ function readJsonConfig(filePath) {
 }
 
 function writeJsonFile(filePath, value, options = {}) {
-  const file = safeReadRegularFile(filePath);
+  const parent = safeWritableParentDirectory(filePath);
+  if (!parent.ok) return { ok: false, code: parent.code, path: parent.path, message: parent.message };
+  const writePath = parent.destination;
+  const file = safeReadRegularFile(writePath);
   if (!file.ok) return { ok: false, code: file.code, path: filePath, message: file.message };
   const body = `${JSON.stringify(value, null, 2)}\n`;
   if (options.dryRun) return { ok: true, changed: !file.exists || file.content !== body };
-  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  fs.writeFileSync(filePath, body, { encoding: 'utf8', mode: 0o600 });
-  if (process.platform !== 'win32') fs.chmodSync(filePath, 0o600);
+  fs.mkdirSync(path.dirname(writePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(writePath, body, { encoding: 'utf8', mode: 0o600 });
+  if (process.platform !== 'win32') fs.chmodSync(writePath, 0o600);
   return { ok: true, changed: true };
 }
 
@@ -859,11 +938,11 @@ function validateCodexTomlParseable(content) {
 function readCodexConfigForInstall(configPath) {
   const parent = safeWritableParentDirectory(configPath);
   if (!parent.ok) return parent;
-  const config = safeReadRegularFile(configPath);
+  const config = safeReadRegularFile(parent.destination);
   if (!config.ok) return { ok: false, code: config.code, path: configPath, message: config.message };
   const parseable = validateCodexTomlParseable(config.exists ? config.content : '');
   if (!parseable.ok) return { ...parseable, path: configPath };
-  return config;
+  return { ...config, path: parent.destination };
 }
 
 function installCodexLifecycle(options = {}) {
@@ -873,15 +952,16 @@ function installCodexLifecycle(options = {}) {
   if (!support.exact && !options.forceUnsupported) return unsupportedInstallResult('codex', support);
   const config = readCodexConfigForInstall(configPath);
   if (!config.ok) return { ok: false, harness: 'codex', code: config.code, path: config.path || configPath, message: config.message };
+  const writeConfigPath = config.path || configPath;
   const existing = config.exists ? config.content : '';
   const writer = ensureWriter(options);
   if (writer.ok === false) return { ok: false, harness: 'codex', code: writer.code, writerPath: writer.destination, collision: writer.collision };
   const next = `${stripCodexManagedBlock(upsertFeatureHooks(existing)).trimEnd()}\n\n${codexManagedBlock({ ...options, writerPath: writer.destination })}\n`;
-  if (existing !== next) backupExisting(configPath, options);
+  if (existing !== next) backupExisting(writeConfigPath, options);
   if (!options.dryRun) {
-    fs.mkdirSync(path.dirname(configPath), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(configPath, next, { encoding: 'utf8', mode: 0o600 });
-    if (process.platform !== 'win32') fs.chmodSync(configPath, 0o600);
+    fs.mkdirSync(path.dirname(writeConfigPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(writeConfigPath, next, { encoding: 'utf8', mode: 0o600 });
+    if (process.platform !== 'win32') fs.chmodSync(writeConfigPath, 0o600);
   }
   return { ok: true, harness: 'codex', configPath, writerPath: writer.destination, changed: existing !== next || writer.changed, version: support.version, dryRun: Boolean(options.dryRun), forced: !support.exact };
 }
@@ -889,15 +969,18 @@ function installCodexLifecycle(options = {}) {
 function uninstallCodexLifecycle(options = {}) {
   const homeDir = options.homeDir || os.homedir();
   const configPath = options.codexConfigPath || path.join(homeDir, '.codex', 'config.toml');
-  const config = safeReadRegularFile(configPath);
+  const parent = safeWritableParentDirectory(configPath);
+  if (!parent.ok) return { ok: false, harness: 'codex', code: parent.code, path: parent.path };
+  const writeConfigPath = parent.destination;
+  const config = safeReadRegularFile(writeConfigPath);
   if (!config.ok) return { ok: false, harness: 'codex', code: config.code, path: configPath };
   if (!config.exists) return { ok: true, harness: 'codex', changed: false };
   const existing = config.content;
   const next = stripCodexManagedBlock(existing);
   const changed = next !== existing;
   if (changed) {
-    backupExisting(configPath, options);
-    if (!options.dryRun) fs.writeFileSync(configPath, next, { encoding: 'utf8', mode: 0o600 });
+    backupExisting(writeConfigPath, options);
+    if (!options.dryRun) fs.writeFileSync(writeConfigPath, next, { encoding: 'utf8', mode: 0o600 });
   }
   return { ok: true, harness: 'codex', changed, configPath, dryRun: Boolean(options.dryRun) };
 }

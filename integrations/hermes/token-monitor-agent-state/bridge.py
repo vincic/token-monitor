@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,46 @@ def _safe_path(value):
     return isinstance(value, str) and bool(value) and len(value) <= MAX_PATH_CHARS and not any(char in value for char in "\0\r\n")
 
 
+DARWIN_SYSTEM_ALIASES = {
+    "/etc": "/private/etc",
+    "/tmp": "/private/tmp",
+    "/var": "/private/var",
+}
+
+
+def _darwin_system_alias_target(candidate, target):
+    if sys.platform != "darwin":
+        return ""
+    candidate_text = os.path.abspath(os.fspath(candidate))
+    expected = DARWIN_SYSTEM_ALIASES.get(candidate_text)
+    if not expected or candidate_text == os.path.abspath(os.fspath(target)):
+        return ""
+    try:
+        stat = candidate.lstat()
+    except Exception:
+        return ""
+    if not os.path.islink(candidate) or stat.st_uid != 0:
+        return ""
+    try:
+        return expected if os.path.realpath(candidate) == expected else ""
+    except Exception:
+        return ""
+
+
+def _canonical_path_for_darwin_system_aliases(target):
+    resolved = Path(os.path.abspath(os.path.expanduser(os.fspath(target))))
+    if sys.platform != "darwin":
+        return resolved
+    current = Path(resolved.anchor) if resolved.anchor else Path()
+    for part in resolved.parts[1:] if resolved.anchor else resolved.parts:
+        current = current / part if str(current) else Path(part)
+        replacement = _darwin_system_alias_target(current, resolved)
+        if not replacement:
+            continue
+        return Path(replacement) / os.path.relpath(resolved, current)
+    return resolved
+
+
 def _existing_path_components(target):
     path = Path(os.path.abspath(os.path.expanduser(os.fspath(target))))
     parts = []
@@ -75,8 +116,8 @@ def _existing_path_components(target):
 
 
 def _validate_existing_ancestors(root):
-    target = Path(os.path.abspath(os.path.expanduser(os.fspath(root))))
-    for candidate in _existing_path_components(root):
+    target = _canonical_path_for_darwin_system_aliases(root)
+    for candidate in _existing_path_components(target):
         try:
             stat = candidate.lstat()
         except FileNotFoundError:
@@ -93,7 +134,7 @@ def _validate_existing_ancestors(root):
 
 
 def _create_root_under_validated_ancestors(root):
-    for candidate in _existing_path_components(root):
+    for candidate in _existing_path_components(_canonical_path_for_darwin_system_aliases(root)):
         try:
             stat = candidate.lstat()
         except FileNotFoundError:
@@ -115,13 +156,14 @@ def _create_root_under_validated_ancestors(root):
 
 
 def _root_is_safe(root):
-    if not _validate_existing_ancestors(root):
+    canonical_root = _canonical_path_for_darwin_system_aliases(root)
+    if not _validate_existing_ancestors(canonical_root):
         return False
     try:
-        stat = root.lstat()
+        stat = canonical_root.lstat()
     except Exception:
         return False
-    if os.path.islink(root) or not root.is_dir():
+    if os.path.islink(canonical_root) or not canonical_root.is_dir():
         return False
     if os.name == "nt":
         return True
@@ -134,11 +176,12 @@ def _root_is_safe(root):
 
 
 def _ensure_root(root):
-    if not _validate_existing_ancestors(root):
+    canonical_root = _canonical_path_for_darwin_system_aliases(root)
+    if not _validate_existing_ancestors(canonical_root):
         return False
-    if not _create_root_under_validated_ancestors(root):
+    if not _create_root_under_validated_ancestors(canonical_root):
         return False
-    return _root_is_safe(root)
+    return _root_is_safe(canonical_root)
 
 
 def _write_text_exclusive(path, text):

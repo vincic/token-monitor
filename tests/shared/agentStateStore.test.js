@@ -50,7 +50,8 @@ function fakeFsForRoot(root, {
   rootType = 'dir',
   symlinkAncestor = '',
   ancestorMode = 0o700,
-  ancestorUid = 1000
+  ancestorUid = 1000,
+  realpaths = {}
 } = {}) {
   const resolvedRoot = path.resolve(root);
   const stats = new Map();
@@ -63,8 +64,24 @@ function fakeFsForRoot(root, {
     stats.set(current, fakeStat({ type: current === symlinkAncestor ? 'symlink' : 'dir', mode: ancestorMode, uid: ancestorUid }));
   }
   if (rootType !== 'missing') stats.set(resolvedRoot, fakeStat({ type: rootType, mode: rootMode, uid: rootUid }));
+  for (const [from, to] of Object.entries(realpaths)) {
+    const resolvedFrom = path.resolve(from);
+    const resolvedTo = path.resolve(to);
+    stats.set(resolvedFrom, fakeStat({ type: 'symlink', mode: 0o755, uid: 0 }));
+    if (resolvedRoot === resolvedFrom || resolvedRoot.startsWith(`${resolvedFrom}${path.sep}`)) {
+      let canonical = path.join(resolvedTo, path.relative(resolvedFrom, resolvedRoot));
+      const canonicalParts = canonical.slice(path.parse(canonical).root.length).split(path.sep).filter(Boolean);
+      let canonicalCurrent = path.parse(canonical).root;
+      stats.set(canonicalCurrent, fakeStat({ mode: ancestorMode, uid: ancestorUid }));
+      for (const part of canonicalParts.slice(0, -1)) {
+        canonicalCurrent = path.join(canonicalCurrent, part);
+        stats.set(canonicalCurrent, fakeStat({ mode: ancestorMode, uid: ancestorUid }));
+      }
+      if (rootType !== 'missing') stats.set(canonical, fakeStat({ type: rootType, mode: rootMode, uid: rootUid }));
+    }
+  }
   const files = new Map();
-  return {
+  const api = {
     chmods: [],
     lstatSync(filePath) {
       const resolved = path.resolve(filePath);
@@ -90,8 +107,14 @@ function fakeFsForRoot(root, {
     },
     rmSync(filePath) { files.delete(path.resolve(filePath)); },
     readdirSync() { return []; },
-    readFileSync(filePath) { return files.get(path.resolve(filePath)); }
+    readFileSync(filePath) { return files.get(path.resolve(filePath)); },
+    realpathSync(filePath) {
+      const resolved = path.resolve(filePath);
+      return realpaths[resolved] || resolved;
+    }
   };
+  api.realpathSync.native = api.realpathSync;
+  return api;
 }
 
 test('default root follows XDG state and has a Windows-safe fallback', () => {
@@ -242,6 +265,23 @@ test('store accepts macOS-style system-owned permissive ancestors when final roo
   assert.equal(fsApi.lstatSync(root).uid, 501);
 });
 
+test('Darwin store canonicalizes root-owned /var system alias ancestors only', () => {
+  const root = '/var/folders/tm-agent-state-macos-alias/agent-state';
+  const canonicalRoot = '/private/var/folders/tm-agent-state-macos-alias/agent-state';
+  const fsApi = fakeFsForRoot(root, {
+    rootType: 'missing',
+    rootUid: 501,
+    realpaths: { '/var': '/private/var' }
+  });
+  const store = createAgentStateStore({ root, nowMs: NOW, fs: fsApi, getuid: () => 501, platform: 'darwin' });
+
+  const result = store.record(state());
+
+  assert.equal(result.ok, true);
+  assert.equal(result.filePath.startsWith(`${canonicalRoot}${path.sep}`), true);
+  assert.equal(fsApi.lstatSync(canonicalRoot).uid, 501);
+});
+
 test('store refuses a permissive existing root without chmodding it', () => {
   const root = path.join(os.tmpdir(), 'tm-agent-state-owned');
   const fsApi = fakeFsForRoot(root, { rootMode: 0o755, rootUid: 1000 });
@@ -261,6 +301,26 @@ test('store refuses a symlinked existing ancestor component', () => {
 
   assert.deepEqual(store.record(state()), { ok: false, error: 'unsafe_root' });
   assert.deepEqual(store.read({ nowMs: NOW }), []);
+});
+
+test('Darwin store refuses non-system symlink ancestors', () => {
+  const root = '/Users/alice/link/agent-state';
+  const symlinkAncestor = path.resolve('/Users/alice/link');
+  const fsApi = fakeFsForRoot(root, { symlinkAncestor });
+  const store = createAgentStateStore({ root, nowMs: NOW, fs: fsApi, getuid: () => 501, platform: 'darwin' });
+
+  assert.deepEqual(store.record(state()), { ok: false, error: 'unsafe_root' });
+  assert.deepEqual(store.read({ nowMs: NOW }), []);
+});
+
+test('actual-platform store accepts os.tmpdir roots on macOS', { skip: process.platform !== 'darwin' }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-agent-state-darwin-tmp-'));
+  const store = createAgentStateStore({ root, nowMs: NOW });
+
+  const result = store.record(state());
+
+  assert.equal(result.ok, true);
+  assert.equal(store.read({ nowMs: NOW }).length, 1);
 });
 
 test('store refuses a pre-existing root owned by another uid', () => {

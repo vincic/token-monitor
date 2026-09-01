@@ -47,6 +47,42 @@ function modeBits(stat) {
   return Number(stat?.mode || 0) & 0o777;
 }
 
+const DARWIN_SYSTEM_ALIASES = new Map([
+  ['/etc', '/private/etc'],
+  ['/tmp', '/private/tmp'],
+  ['/var', '/private/var']
+]);
+
+function fsRealpath(targetPath) {
+  return fs.realpathSync.native(targetPath);
+}
+
+function darwinSystemAliasTarget(candidate, target) {
+  if (process.platform !== 'darwin') return '';
+  const expected = DARWIN_SYSTEM_ALIASES.get(candidate);
+  if (!expected || candidate === target) return '';
+  const stat = safeCall(() => fs.lstatSync(candidate), null);
+  if (!stat || !stat.isSymbolicLink?.() || stat.uid !== 0) return '';
+  const real = safeCall(() => fsRealpath(candidate), '');
+  return real === expected ? real : '';
+}
+
+function canonicalPathForDarwinSystemAliases(targetPath) {
+  let resolved = path.resolve(targetPath);
+  if (process.platform !== 'darwin') return resolved;
+  const root = path.parse(resolved).root;
+  const parts = resolved.slice(root.length).split(path.sep).filter(Boolean);
+  let current = root;
+  for (const part of parts) {
+    current = path.join(current, part);
+    const replacement = darwinSystemAliasTarget(current, resolved);
+    if (!replacement) continue;
+    resolved = path.join(replacement, path.relative(current, resolved));
+    break;
+  }
+  return resolved;
+}
+
 function existingPathComponents(targetPath) {
   const resolved = path.resolve(targetPath);
   const parsed = path.parse(resolved);
@@ -61,18 +97,19 @@ function existingPathComponents(targetPath) {
 }
 
 function validateExistingAncestors(dir) {
-  for (const candidate of existingPathComponents(dir)) {
+  const target = canonicalPathForDarwinSystemAliases(dir);
+  for (const candidate of existingPathComponents(target)) {
     const stat = safeCall(() => fs.lstatSync(candidate), null);
     if (!stat) continue;
     if (stat.isSymbolicLink?.()) return false;
-    if (candidate === path.resolve(dir)) return stat.isDirectory?.() === true;
+    if (candidate === target) return stat.isDirectory?.() === true;
     if (!stat.isDirectory?.()) return false;
   }
   return true;
 }
 
 function createRootUnderValidatedAncestors(dir) {
-  for (const candidate of existingPathComponents(dir)) {
+  for (const candidate of existingPathComponents(canonicalPathForDarwinSystemAliases(dir))) {
     const existing = safeCall(() => fs.lstatSync(candidate), null);
     if (existing) {
       if (existing.isSymbolicLink?.() || !existing.isDirectory?.()) return false;
@@ -86,8 +123,9 @@ function createRootUnderValidatedAncestors(dir) {
 }
 
 function rootIsSafe(dir) {
-  if (!validateExistingAncestors(dir)) return false;
-  const stat = safeCall(() => fs.lstatSync(dir), null);
+  const canonicalRoot = canonicalPathForDarwinSystemAliases(dir);
+  if (!validateExistingAncestors(canonicalRoot)) return false;
+  const stat = safeCall(() => fs.lstatSync(canonicalRoot), null);
   if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) return false;
   if (process.platform === 'win32') return true;
   const uid = currentUid();
@@ -96,9 +134,10 @@ function rootIsSafe(dir) {
 }
 
 function ensureRoot(dir) {
-  if (!validateExistingAncestors(dir)) return false;
-  if (!createRootUnderValidatedAncestors(dir)) return false;
-  return rootIsSafe(dir);
+  const canonicalRoot = canonicalPathForDarwinSystemAliases(dir);
+  if (!validateExistingAncestors(canonicalRoot)) return false;
+  if (!createRootUnderValidatedAncestors(canonicalRoot)) return false;
+  return rootIsSafe(canonicalRoot);
 }
 
 function tempSnapshotPath(dir, file) {

@@ -1086,6 +1086,33 @@ test('shared writer refuses unmanaged collisions and backs up managed changes', 
   assert.equal(fs.readdirSync(homeDir).filter((name) => name.includes('.bak.')).length, 1);
 });
 
+test('actual-platform writer accepts os.tmpdir destinations on macOS', { skip: process.platform !== 'darwin' }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-agent-life-darwin-writer-'));
+  const dest = path.join(root, 'agent-event.js');
+
+  const result = ensureWriter({ writerPath: dest });
+
+  assert.equal(result.ok, true);
+  assert.equal(fs.existsSync(dest), true);
+});
+
+test('actual-platform Codex config under os.tmpdir reports TOML errors on macOS', { skip: process.platform !== 'darwin' }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-agent-life-darwin-config-'));
+  const configPath = path.join(root, '.codex', 'config.toml');
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, 'invalid toml\n');
+
+  const result = installCodexLifecycle({
+    homeDir: root,
+    codexConfigPath: configPath,
+    codexVersion: '0.150.1',
+    stateRoot: path.join(root, 'state')
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'invalid_toml');
+});
+
 test('shared writer and Claude/Codex config paths fail cleanly on unsafe destination types', (t) => {
   const homeDir = tempRoot();
   const writerDir = path.join(homeDir, 'agent-event.js');
